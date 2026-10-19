@@ -1,0 +1,20 @@
+# Credenciais - NUNCA versionar
+credenciais.json
+
+# Saídas geradas em tempo de execução
+downloads_darj/
+debug_*.png
+debug_*.html
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# SO / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
