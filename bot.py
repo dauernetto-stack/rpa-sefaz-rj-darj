@@ -419,49 +419,59 @@ if not os.path.exists(diretorio_download):
 # for setado manualmente), e com tela visível em execução local normal.
 RODANDO_HEADLESS = os.getenv("HEADLESS", "").lower() == "true" or os.getenv("GITHUB_ACTIONS") == "true"
 
-opcoes = Options()
-opcoes.add_argument("--disable-blink-features=AutomationControlled")
-opcoes.add_experimental_option("excludeSwitches", ["enable-automation"])
-opcoes.add_experimental_option('useAutomationExtension', False)
-opcoes.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-if RODANDO_HEADLESS:
-    print("   (Executando em modo headless - sem interface gráfica, como no GitHub Actions)")
-    opcoes.add_argument("--headless=new")
-    opcoes.add_argument("--no-sandbox")
-    opcoes.add_argument("--disable-dev-shm-usage")
-    opcoes.add_argument("--window-size=1920,1080")
-else:
-    opcoes.add_argument("--start-maximized")
+def criar_driver_chrome():
+    """Cria (ou recria, numa nova tentativa) uma instância nova do Chrome já
+    configurada (anti-detecção de automação, downloads habilitados em modo
+    headless, etc.)."""
+    opcoes = Options()
+    opcoes.add_argument("--disable-blink-features=AutomationControlled")
+    opcoes.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opcoes.add_experimental_option('useAutomationExtension', False)
+    opcoes.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-prefs = {
-    "download.default_directory": diretorio_download,
-    "download.prompt_for_download": False,
-    "download.directory_upgrade": True,
-    "plugins.always_open_pdf_externally": True
-}
-opcoes.add_experimental_option("prefs", prefs)
+    if RODANDO_HEADLESS:
+        print("   (Executando em modo headless - sem interface gráfica, como no GitHub Actions)")
+        opcoes.add_argument("--headless=new")
+        opcoes.add_argument("--no-sandbox")
+        opcoes.add_argument("--disable-dev-shm-usage")
+        opcoes.add_argument("--window-size=1920,1080")
+    else:
+        opcoes.add_argument("--start-maximized")
 
-servico = Service(ChromeDriverManager().install())
-driver = webdriver.Chrome(service=servico, options=opcoes)
+    prefs = {
+        "download.default_directory": diretorio_download,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "plugins.always_open_pdf_externally": True
+    }
+    opcoes.add_experimental_option("prefs", prefs)
 
-driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-    'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-})
+    servico = Service(ChromeDriverManager().install())
+    driver_novo = webdriver.Chrome(service=servico, options=opcoes)
 
-# Necessário para habilitar downloads em modo --headless=new (bloqueados por padrão).
-driver.execute_cdp_cmd("Page.setDownloadBehavior", {
-    "behavior": "allow",
-    "downloadPath": diretorio_download
-})
+    driver_novo.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+        'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    })
 
-wait = WebDriverWait(driver, 30)
+    # Necessário para habilitar downloads em modo --headless=new (bloqueados por padrão).
+    driver_novo.execute_cdp_cmd("Page.setDownloadBehavior", {
+        "behavior": "allow",
+        "downloadPath": diretorio_download
+    })
 
-# ==============================================================================
-# FASE 3: NAVEGAÇÃO E PREENCHIMENTO DO FORMULÁRIO
-# ==============================================================================
+    wait_novo = WebDriverWait(driver_novo, 30)
+    return driver_novo, wait_novo
 
-try:
+
+def preencher_formulario_ate_auditoria(driver, wait):
+    """Passos 1 a 10 do formulário + auditoria de segurança (BLINDAGEM),
+    tudo ANTES de confirmar o item na SEFAZ-RJ. Nenhuma ação irreversível
+    acontece aqui (nada de 'Confirmar item' / 'Gerar DARJ'), então é seguro
+    chamar de novo (com um navegador novo) se o portal falhar de forma
+    transitória - já vimos isso acontecer em pontos diferentes do
+    formulário em testes reais (timeout no CNPJ com alert nativo de
+    servidor, timeout ao selecionar o Produto, etc.)."""
     print("1. Acessando o Portal de Pagamentos da SEFAZ-RJ...")
     driver.get("https://www1.fazenda.rj.gov.br/portaldepagamentos/")
     print(f"   -> Página carregada. URL atual: {driver.current_url} | Título: {driver.title!r}")
@@ -605,124 +615,160 @@ try:
 
     print("✅ VALIDAÇÃO DE SEGURANÇA CONCLUÍDA: Valores aprovados!")
 
-    print("11. Clicando em 'Confirmar item'...")
-    btn_confirmar_item = wait.until(EC.element_to_be_clickable((
-        By.XPATH, "//input[@type='button' and contains(@value,'Confirmar item')]"
-    )))
-    btn_confirmar_item.click()
-    time.sleep(1.5)
-    fechar_modal_informacao_se_existir(driver)
 
-    # ==========================================================================
-    # FASE 4: RESUMO DE PAGAMENTO E GERAÇÃO DO DARJ
-    # ==========================================================================
-    print("12. Aguardando tela de Resumo de pagamento...")
-    wait.until(EC.presence_of_element_located((
-        By.XPATH, "//*[contains(text(),'Resumo de pagamento') or contains(text(),'Gerar DARJ')]"
-    )))
+# ==============================================================================
+# FASE 3: NAVEGAÇÃO E PREENCHIMENTO DO FORMULÁRIO (com retry em falha transitória)
+# ==============================================================================
 
-    # Marca a checkbox do item, se existir
+MAX_TENTATIVAS_PREENCHIMENTO = 2
+driver = None
+wait = None
+erro_preenchimento = None
+
+for tentativa in range(1, MAX_TENTATIVAS_PREENCHIMENTO + 1):
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    driver, wait = criar_driver_chrome()
     try:
-        checkboxes = driver.find_elements(By.XPATH, "//table//input[@type='checkbox']")
-        for cb in checkboxes:
-            if not cb.is_selected():
-                driver.execute_script("arguments[0].click();", cb)
-    except Exception:
-        pass
+        preencher_formulario_ate_auditoria(driver, wait)
+        erro_preenchimento = None
+        break
+    except Exception as e:
+        erro_preenchimento = e
+        print(f"⚠️ Tentativa {tentativa}/{MAX_TENTATIVAS_PREENCHIMENTO} de preenchimento do formulário falhou: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        dump_debug(driver, f"erro_preenchimento_tentativa_{tentativa}")
+        if tentativa < MAX_TENTATIVAS_PREENCHIMENTO:
+            print("   -> Fechando o navegador e tentando tudo de novo do zero...")
+            time.sleep(3)
 
-    dump_debug(driver, "resumo_pagamento_pre_geracao")  # registro para auditoria, sempre salvo
-
-    print("13. Clicando em 'Gerar DARJ'...")
-    btn_gerar_darj = wait.until(EC.element_to_be_clickable((
-        By.XPATH, "//input[@type='button' and contains(@value,'Gerar DARJ')] | //a[contains(.,'Gerar DARJ')]"
-    )))
-    btn_gerar_darj.click()
-    time.sleep(3)
-
-    # ==========================================================================
-    # FASE 5: EXTRAÇÃO DOS DADOS DA GUIA GERADA
-    # ==========================================================================
-    print("14. Extraindo dados da guia DARJ gerada...")
-
-    # Pode abrir em nova aba/janela - trata ambos os casos
-    if len(driver.window_handles) > 1:
-        driver.switch_to.window(driver.window_handles[-1])
-
-    time.sleep(2)
-
-    dados_darj = driver.execute_script("""
-        var textoPagina = document.body.innerText;
-        var matchNum = textoPagina.match(/N[úu]mero (?:do )?(?:Documento|DARJ):?\\s*([\\w\\-\\.\\/]+)/i);
-        var matchVcto = textoPagina.match(/(?:Vencimento|Validade):?\\s*([\\d\\/]+)/i);
-        var matchValor = textoPagina.match(/Valor(?: Total)?:?\\s*(?:do Documento)?:?\\s*(R\\$)?\\s*([\\d\\.,]+)/i);
-        return {
-            numDarj: matchNum ? matchNum[1].trim() : '',
-            vencimento: matchVcto ? matchVcto[1].trim() : '',
-            valor: matchValor ? matchValor[2].trim() : ''
-        };
-    """)
-
-    link_darj_atual = driver.current_url
-    print(f"Dados extraídos -> Nº DARJ: {dados_darj['numDarj']}, Vencimento: {dados_darj['vencimento']}, Valor: {dados_darj['valor']}")
-
-    if not dados_darj['numDarj']:
-        dump_debug(driver, "extracao_numero_darj_falhou")
-        print("⚠️ Não foi possível localizar automaticamente o Nº do DARJ na página. "
-              "Verifique debug_extracao_numero_darj_falhou.png/html e ajuste os seletores/regex acima.")
-
-    # Tenta localizar um link/botão de download do PDF do boleto
+if erro_preenchimento is not None:
+    print(f"Ocorreu um erro na automação: {type(erro_preenchimento).__name__}: {erro_preenchimento}")
+    if driver is not None:
+        driver.quit()
+else:
     try:
-        link_pdf = driver.find_element(
-            By.XPATH,
-            "//a[contains(@href,'.pdf') or contains(@onclick,'pdf') or contains(.,'Imprimir') or contains(.,'Download')] "
-            "| //img[contains(@src,'barcode') or contains(@alt,'Imprimir')]"
-        )
-        driver.execute_script("arguments[0].click();", link_pdf)
-        time.sleep(4)
-    except Exception:
-        print("⚠️ Não encontrei automaticamente um botão/link de download do PDF. "
-              "Pode ser necessário desativar bloqueador de pop-up ou ajustar o seletor.")
-        dump_debug(driver, "pdf_nao_encontrado")
+        print("11. Clicando em 'Confirmar item'...")
+        btn_confirmar_item = wait.until(EC.element_to_be_clickable((
+            By.XPATH, "//input[@type='button' and contains(@value,'Confirmar item')]"
+        )))
+        btn_confirmar_item.click()
+        time.sleep(1.5)
+        fechar_modal_informacao_se_existir(driver)
 
-    arquivos_pdf = [os.path.join(diretorio_download, f) for f in os.listdir(diretorio_download) if f.endswith('.pdf')]
-    if arquivos_pdf:
-        pdf_recente = max(arquivos_pdf, key=os.path.getctime)
-        num_darj_limpo = re.sub(r'[^0-9A-Za-z]', '', dados_darj['numDarj']) or 'SEMNUMERO'
-        nome_personalizado = f"DARJ_NF_{nota_fiscal}_{num_darj_limpo}.pdf"
-        caminho_renomeado = os.path.join(diretorio_download, nome_personalizado)
-        if os.path.exists(caminho_renomeado):
-            os.remove(caminho_renomeado)
-        os.rename(pdf_recente, caminho_renomeado)
-        print(f"PDF local salvo e renomeado para: {nome_personalizado}")
+        # ==========================================================================
+        # FASE 4: RESUMO DE PAGAMENTO E GERAÇÃO DO DARJ
+        # ==========================================================================
+        print("12. Aguardando tela de Resumo de pagamento...")
+        wait.until(EC.presence_of_element_located((
+            By.XPATH, "//*[contains(text(),'Resumo de pagamento') or contains(text(),'Gerar DARJ')]"
+        )))
 
-        print("14.1. Enviando PDF para a pasta do Google Drive...")
-        enviar_pdf_para_drive(caminho_renomeado, ID_PASTA_DRIVE, creds)
-    else:
-        print("Aviso: Nenhum PDF foi localizado na pasta de downloads.")
+        # Marca a checkbox do item, se existir
+        try:
+            checkboxes = driver.find_elements(By.XPATH, "//table//input[@type='checkbox']")
+            for cb in checkboxes:
+                if not cb.is_selected():
+                    driver.execute_script("arguments[0].click();", cb)
+        except Exception:
+            pass
 
-    # ==========================================================================
-    # FASE 6: GRAVAÇÃO DOS RESULTADOS NA PLANILHA
-    # ==========================================================================
-    print("15. Gravando informações na planilha Google...")
+        dump_debug(driver, "resumo_pagamento_pre_geracao")  # registro para auditoria, sempre salvo
 
-    col_num_darj = encontrar_coluna(['Nº DARJ'], 'Nº DARJ')
-    col_vcto_darj = encontrar_coluna(['Vcto DARJ'], 'Vcto DARJ')
-    col_valor_darj = encontrar_coluna(['Valor DARJ'], 'Valor DARJ')
-    col_link_darj = encontrar_coluna(['Link DARJ'], 'Link DARJ')
+        print("13. Clicando em 'Gerar DARJ'...")
+        btn_gerar_darj = wait.until(EC.element_to_be_clickable((
+            By.XPATH, "//input[@type='button' and contains(@value,'Gerar DARJ')] | //a[contains(.,'Gerar DARJ')]"
+        )))
+        btn_gerar_darj.click()
+        time.sleep(3)
 
-    planilha.update_cell(linha_alvo_index, col_num_darj, dados_darj['numDarj'])
-    planilha.update_cell(linha_alvo_index, col_vcto_darj, dados_darj['vencimento'] or dt_vencimento_str)
-    planilha.update_cell(linha_alvo_index, col_valor_darj, dados_darj['valor'] or f"{darj_normal_float + fecp_float:.2f}".replace('.', ','))
-    planilha.update_cell(linha_alvo_index, col_link_darj, link_darj_atual)
+        # ==========================================================================
+        # FASE 5: EXTRAÇÃO DOS DADOS DA GUIA GERADA
+        # ==========================================================================
+        print("14. Extraindo dados da guia DARJ gerada...")
 
-    print("Planilha atualizada com sucesso!")
-    print("Processo concluído!")
+        # Pode abrir em nova aba/janela - trata ambos os casos
+        if len(driver.window_handles) > 1:
+            driver.switch_to.window(driver.window_handles[-1])
 
-except Exception as erro:
-    print(f"Ocorreu um erro na automação: {type(erro).__name__}: {erro}")
-    print("   -> Traceback completo:")
-    traceback.print_exc()
-    dump_debug(driver, "erro_execucao")
+        time.sleep(2)
 
-finally:
-    driver.quit()
+        dados_darj = driver.execute_script("""
+            var textoPagina = document.body.innerText;
+            var matchNum = textoPagina.match(/N[úu]mero (?:do )?(?:Documento|DARJ):?\\s*([\\w\\-\\.\\/]+)/i);
+            var matchVcto = textoPagina.match(/(?:Vencimento|Validade):?\\s*([\\d\\/]+)/i);
+            var matchValor = textoPagina.match(/Valor(?: Total)?:?\\s*(?:do Documento)?:?\\s*(R\\$)?\\s*([\\d\\.,]+)/i);
+            return {
+                numDarj: matchNum ? matchNum[1].trim() : '',
+                vencimento: matchVcto ? matchVcto[1].trim() : '',
+                valor: matchValor ? matchValor[2].trim() : ''
+            };
+        """)
+
+        link_darj_atual = driver.current_url
+        print(f"Dados extraídos -> Nº DARJ: {dados_darj['numDarj']}, Vencimento: {dados_darj['vencimento']}, Valor: {dados_darj['valor']}")
+
+        if not dados_darj['numDarj']:
+            dump_debug(driver, "extracao_numero_darj_falhou")
+            print("⚠️ Não foi possível localizar automaticamente o Nº do DARJ na página. "
+                  "Verifique debug_extracao_numero_darj_falhou.png/html e ajuste os seletores/regex acima.")
+
+        # Tenta localizar um link/botão de download do PDF do boleto
+        try:
+            link_pdf = driver.find_element(
+                By.XPATH,
+                "//a[contains(@href,'.pdf') or contains(@onclick,'pdf') or contains(.,'Imprimir') or contains(.,'Download')] "
+                "| //img[contains(@src,'barcode') or contains(@alt,'Imprimir')]"
+            )
+            driver.execute_script("arguments[0].click();", link_pdf)
+            time.sleep(4)
+        except Exception:
+            print("⚠️ Não encontrei automaticamente um botão/link de download do PDF. "
+                  "Pode ser necessário desativar bloqueador de pop-up ou ajustar o seletor.")
+            dump_debug(driver, "pdf_nao_encontrado")
+
+        arquivos_pdf = [os.path.join(diretorio_download, f) for f in os.listdir(diretorio_download) if f.endswith('.pdf')]
+        if arquivos_pdf:
+            pdf_recente = max(arquivos_pdf, key=os.path.getctime)
+            num_darj_limpo = re.sub(r'[^0-9A-Za-z]', '', dados_darj['numDarj']) or 'SEMNUMERO'
+            nome_personalizado = f"DARJ_NF_{nota_fiscal}_{num_darj_limpo}.pdf"
+            caminho_renomeado = os.path.join(diretorio_download, nome_personalizado)
+            if os.path.exists(caminho_renomeado):
+                os.remove(caminho_renomeado)
+            os.rename(pdf_recente, caminho_renomeado)
+            print(f"PDF local salvo e renomeado para: {nome_personalizado}")
+
+            print("14.1. Enviando PDF para a pasta do Google Drive...")
+            enviar_pdf_para_drive(caminho_renomeado, ID_PASTA_DRIVE, creds)
+        else:
+            print("Aviso: Nenhum PDF foi localizado na pasta de downloads.")
+
+        # ==========================================================================
+        # FASE 6: GRAVAÇÃO DOS RESULTADOS NA PLANILHA
+        # ==========================================================================
+        print("15. Gravando informações na planilha Google...")
+
+        col_num_darj = encontrar_coluna(['Nº DARJ'], 'Nº DARJ')
+        col_vcto_darj = encontrar_coluna(['Vcto DARJ'], 'Vcto DARJ')
+        col_valor_darj = encontrar_coluna(['Valor DARJ'], 'Valor DARJ')
+        col_link_darj = encontrar_coluna(['Link DARJ'], 'Link DARJ')
+
+        planilha.update_cell(linha_alvo_index, col_num_darj, dados_darj['numDarj'])
+        planilha.update_cell(linha_alvo_index, col_vcto_darj, dados_darj['vencimento'] or dt_vencimento_str)
+        planilha.update_cell(linha_alvo_index, col_valor_darj, dados_darj['valor'] or f"{darj_normal_float + fecp_float:.2f}".replace('.', ','))
+        planilha.update_cell(linha_alvo_index, col_link_darj, link_darj_atual)
+
+        print("Planilha atualizada com sucesso!")
+        print("Processo concluído!")
+
+    except Exception as erro:
+        print(f"Ocorreu um erro na automação: {type(erro).__name__}: {erro}")
+        print("   -> Traceback completo:")
+        traceback.print_exc()
+        dump_debug(driver, "erro_execucao")
+
+    finally:
+        driver.quit()
