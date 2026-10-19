@@ -515,25 +515,55 @@ def preencher_formulario_ate_auditoria(driver, wait):
     campo_data_pagamento.send_keys(dt_pagamento_str)
     time.sleep(0.3)
 
-    print("3. Selecionando Natureza = 'Substituição Tributária por Operação / Outros'...")
-    select_natureza = Select(wait.until(EC.element_to_be_clickable((By.ID, "slcNaturezaLista"))))
-    select_natureza.select_by_visible_text(NATUREZA_TEXTO)
-    time.sleep(1)
+    # O campo Produto é populado via AJAX disparado pela seleção de Natureza -
+    # em pelo menos dois testes reais essa chamada não completou a tempo e o
+    # combobox nunca ficou clicável (TimeoutException), sem relação aparente
+    # com nenhum defeito de código. Por isso repetimos as duas seleções (não
+    # só a de Produto) algumas vezes antes de desistir, já que selecionar a
+    # Natureza de novo é o que redispara a chamada AJAX que popula o Produto.
+    ultimo_erro_produto = None
+    for tentativa_produto in range(1, 4):
+        try:
+            print("3. Selecionando Natureza = 'Substituição Tributária por Operação / Outros'...")
+            select_natureza = Select(wait.until(EC.element_to_be_clickable((By.ID, "slcNaturezaLista"))))
+            select_natureza.select_by_visible_text(NATUREZA_TEXTO)
+            time.sleep(1)
 
-    print("4. Selecionando Produto...")
-    select_produto = Select(wait.until(EC.element_to_be_clickable((By.ID, "slcListaProduto"))))
-    select_produto.select_by_visible_text(PRODUTO_TEXTO)
-    time.sleep(0.5)
+            print("4. Selecionando Produto...")
+            select_produto = Select(wait.until(EC.element_to_be_clickable((By.ID, "slcListaProduto"))))
+            select_produto.select_by_visible_text(PRODUTO_TEXTO)
+            time.sleep(0.5)
+            ultimo_erro_produto = None
+            break
+        except (TimeoutException, UnexpectedAlertPresentException) as e:
+            ultimo_erro_produto = e
+            texto_alerta = descartar_alerta_nativo_se_existir(driver)
+            print(
+                f"   -> Tentativa {tentativa_produto} de selecionar Natureza/Produto falhou "
+                f"({type(e).__name__}: {e}); alert() nativo encontrado: {texto_alerta!r}. "
+                f"{'Tentando novamente...' if tentativa_produto < 3 else 'Sem mais tentativas.'}"
+            )
+            time.sleep(2)
+
+    if ultimo_erro_produto is not None:
+        dump_debug(driver, "erro_selecao_produto")
+        raise Exception(
+            f"❌ ERRO CRÍTICO: Não foi possível selecionar o Produto após 3 tentativas. "
+            f"Último erro: {type(ultimo_erro_produto).__name__}: {ultimo_erro_produto}"
+        )
 
     print("5. Preenchendo CNPJ e confirmando dados cadastrais...")
-    # O portal já exibiu um alert() nativo transitório de servidor ("Invalid
-    # reply from server") nessa consulta em pelo menos um teste real - a
-    # mesma etapa funcionou normalmente minutos antes e depois, então
-    # tentamos de novo uma vez (preenchendo o CNPJ do zero) antes de desistir.
+    # Essa consulta já falhou de duas formas transitórias diferentes em
+    # testes reais: um alert() nativo de servidor ("Invalid reply from
+    # server"), e uma mensagem de bloqueio por reputação de IP injetada
+    # dentro da própria página (sem alert nenhum, só TimeoutException porque
+    # os campos de retorno nunca foram preenchidos). As duas vezes a mesma
+    # consulta funcionou normalmente minutos antes/depois, então repetimos
+    # (preenchendo o CNPJ do zero) até 3 vezes antes de desistir.
     insc_estadual_lida = ""
     razao_social_lida = ""
     ultimo_erro_lookup = None
-    for tentativa_cnpj in range(1, 3):
+    for tentativa_cnpj in range(1, 4):
         try:
             campo_cnpj = wait.until(EC.element_to_be_clickable((By.ID, "txtCnpjCpf")))
             campo_cnpj.clear()
@@ -551,7 +581,7 @@ def preencher_formulario_ate_auditoria(driver, wait):
             print(
                 f"   -> Tentativa {tentativa_cnpj} da consulta de CNPJ falhou "
                 f"({type(e).__name__}: {e}); alert() nativo encontrado: {texto_alerta!r}. "
-                f"{'Tentando novamente...' if tentativa_cnpj == 1 else 'Sem mais tentativas.'}"
+                f"{'Tentando novamente...' if tentativa_cnpj < 3 else 'Sem mais tentativas.'}"
             )
             time.sleep(2)
 
@@ -641,7 +671,7 @@ def preencher_formulario_ate_auditoria(driver, wait):
 # FASE 3: NAVEGAÇÃO E PREENCHIMENTO DO FORMULÁRIO (com retry em falha transitória)
 # ==============================================================================
 
-MAX_TENTATIVAS_PREENCHIMENTO = 2
+MAX_TENTATIVAS_PREENCHIMENTO = 3
 driver = None
 wait = None
 erro_preenchimento = None
