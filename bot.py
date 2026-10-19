@@ -290,12 +290,24 @@ diretorio_download = os.path.abspath("downloads_darj")
 if not os.path.exists(diretorio_download):
     os.makedirs(diretorio_download)
 
+# Roda headless automaticamente dentro do GitHub Actions (ou se HEADLESS=true
+# for setado manualmente), e com tela visível em execução local normal.
+RODANDO_HEADLESS = os.getenv("HEADLESS", "").lower() == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+
 opcoes = Options()
-opcoes.add_argument("--start-maximized")
 opcoes.add_argument("--disable-blink-features=AutomationControlled")
 opcoes.add_experimental_option("excludeSwitches", ["enable-automation"])
 opcoes.add_experimental_option('useAutomationExtension', False)
 opcoes.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+if RODANDO_HEADLESS:
+    print("   (Executando em modo headless - sem interface gráfica, como no GitHub Actions)")
+    opcoes.add_argument("--headless=new")
+    opcoes.add_argument("--no-sandbox")
+    opcoes.add_argument("--disable-dev-shm-usage")
+    opcoes.add_argument("--window-size=1920,1080")
+else:
+    opcoes.add_argument("--start-maximized")
 
 prefs = {
     "download.default_directory": diretorio_download,
@@ -310,6 +322,12 @@ driver = webdriver.Chrome(service=servico, options=opcoes)
 
 driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
     'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+})
+
+# Necessário para habilitar downloads em modo --headless=new (bloqueados por padrão).
+driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+    "behavior": "allow",
+    "downloadPath": diretorio_download
 })
 
 wait = WebDriverWait(driver, 20)

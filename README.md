@@ -7,6 +7,13 @@ da SEFAZ-RJ (`https://www1.fazenda.rj.gov.br/portaldepagamentos/`), gera a
 guia, salva o PDF na pasta do Google Drive da equipe e grava os dados da guia
 de volta na planilha.
 
+**Este robô roda de forma 100% automática no GitHub Actions** (serverless,
+sem precisar de nenhuma estação/computador ligado) — veja a seção
+[Rodando no GitHub Actions](#rodando-no-github-actions-recomendado--serverless)
+abaixo. Também é possível rodar localmente (seção
+[Rodando manualmente](#rodando-manualmente)), por exemplo para depurar
+visualmente a primeira execução.
+
 ## Pré-requisitos
 
 - Python 3.10+
@@ -68,7 +75,68 @@ Em caso de erro, o script salva automaticamente `debug_<etapa>.png` e
 `debug_<etapa>.html` na pasta do projeto, com um retrato exato da tela no
 momento da falha — isso é o primeiro lugar a olhar para diagnosticar.
 
-## Agendamento automático (rodar todo dia útil)
+## Rodando no GitHub Actions (recomendado — serverless)
+
+O repositório já inclui o workflow `.github/workflows/darj-rj.yml`, que roda
+o robô automaticamente todo dia útil às 08:00 (horário de Brasília), direto
+num runner do GitHub — sem precisar de computador nenhum ligado. Ele também
+pode ser disparado manualmente a qualquer momento.
+
+### 1. Gerar o secret da credencial do Google (uma vez só)
+
+O `credenciais.json` real **nunca** vai para o repositório (ele está no
+`.gitignore`). Em vez disso, ele é guardado como um *Secret* criptografado do
+GitHub e escrito em disco só durante a execução do workflow, dentro do
+runner descartável.
+
+Com o arquivo `credenciais.json` (a chave da service account
+`guias-dare-dae@rpa-guias-dare-dae.iam.gserviceaccount.com`) em mãos, gere a
+versão em base64 (isso evita problemas do GitHub em mascarar segredos com
+múltiplas linhas):
+
+```bash
+# Linux/Mac:
+base64 -w0 credenciais.json
+
+# Windows (PowerShell):
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("credenciais.json"))
+```
+
+Copie a string gigante que isso gerar (sem quebras de linha).
+
+### 2. Cadastrar o secret no repositório
+
+No GitHub: **Settings → Secrets and variables → Actions → New repository
+secret**.
+
+- Nome: `GOOGLE_CREDENTIALS_B64`
+- Valor: cole a string em base64 gerada no passo anterior
+
+### 3. Pronto
+
+O workflow já está agendado (`cron: '0 11 * * 1-5'` = 08:00 em Brasília, seg
+a sex). Para rodar manualmente a qualquer momento: aba **Actions** do
+repositório → workflow "RPA DARJ-RJ (emissão automática)" → **Run workflow**.
+
+Se alguma etapa falhar, o workflow salva automaticamente um artefato
+(`debug-<id do run>`) com os screenshots/HTML de debug daquele momento —
+baixe esse artefato na própria página do run, em "Actions", pra diagnosticar.
+
+> **Atenção:** o GitHub desativa automaticamente workflows agendados
+> (`schedule`) em repositórios sem nenhuma atividade (commits, etc.) por
+> 60 dias. Se isso acontecer, basta reativar manualmente na aba Actions.
+
+### Observação sobre downloads em modo headless
+
+O `bot.py` já detecta sozinho quando está rodando dentro do GitHub Actions
+(variável de ambiente `GITHUB_ACTIONS`) e liga automaticamente o modo
+`--headless=new` do Chrome, incluindo a configuração necessária para permitir
+downloads de PDF nesse modo. Rodando localmente, continua abrindo o Chrome
+normalmente (com tela), o que ajuda a depurar visualmente.
+
+## Agendamento automático em uma estação local (alternativa)
+
+Se preferir rodar numa máquina própria em vez do GitHub Actions:
 
 ### Windows (Agendador de Tarefas)
 

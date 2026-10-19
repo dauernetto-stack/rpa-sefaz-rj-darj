@@ -1,0 +1,49 @@
+name: RPA DARJ-RJ (emissão automática)
+
+on:
+  schedule:
+    # 08:00 horário de Brasília (UTC-3, sem horário de verão) = 11:00 UTC,
+    # de segunda a sexta. Ajuste o horário/dias aqui se precisar.
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch: {}   # permite rodar manualmente pela aba "Actions" do GitHub
+
+jobs:
+  emitir-darj:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configura Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instala dependências Python
+        run: pip install -r requirements.txt
+
+      - name: Instala o Google Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Escreve credenciais.json a partir do secret (nunca commitado)
+        env:
+          GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
+        run: echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > credenciais.json
+
+      - name: Roda o robô de emissão do DARJ
+        env:
+          HEADLESS: "true"
+        run: python bot.py
+
+      - name: Salva screenshots/HTML de debug como artefato (se houver)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: |
+            debug_*.png
+            debug_*.html
+          if-no-files-found: ignore
+          retention-days: 14
