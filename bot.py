@@ -199,7 +199,36 @@ creds = ServiceAccountCredentials.from_json_keyfile_name("credenciais.json", sco
 client = gspread.authorize(creds)
 
 planilha = client.open_by_key(ID_PLANILHA).sheet1
-registros = planilha.get_all_records(value_render_option='FORMATTED_VALUE')
+
+# Lemos os valores "crus" (em vez de usar get_all_records) porque a planilha
+# tem colunas extras sem cabeçalho (células em branco na linha 1) à direita
+# dos dados reais - o gspread trava com "header row contains duplicates: ['']"
+# quando há mais de uma coluna com cabeçalho vazio.
+_todos_valores = planilha.get_all_values(value_render_option='FORMATTED_VALUE')
+_cabecalhos_brutos = _todos_valores[0] if _todos_valores else []
+
+# Deduplica/preenche cabeçalhos vazios ou repetidos para podermos montar os
+# registros como dicionários sem conflito de chave.
+_cabecalhos_unicos = []
+_vistos = {}
+for _idx, _h in enumerate(_cabecalhos_brutos):
+    _h = str(_h).strip()
+    if _h == '':
+        _h = f'_coluna_vazia_{_idx + 1}'
+    if _h in _vistos:
+        _vistos[_h] += 1
+        _h = f'{_h}_{_vistos[_h]}'
+    else:
+        _vistos[_h] = 0
+    _cabecalhos_unicos.append(_h)
+
+registros = []
+for _linha in _todos_valores[1:]:
+    # ignora linhas totalmente em branco
+    if not any(str(v).strip() for v in _linha):
+        continue
+    _linha_completa = _linha + [''] * (len(_cabecalhos_unicos) - len(_linha))
+    registros.append(dict(zip(_cabecalhos_unicos, _linha_completa)))
 
 hoje = pd.Timestamp.today()
 d_menos_1 = hoje - pd.offsets.BDay(1)
