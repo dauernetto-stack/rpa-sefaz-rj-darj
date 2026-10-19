@@ -475,20 +475,29 @@ try:
     campo_info.clear()
     campo_info.send_keys(f"NF {nota_fiscal_raw}")
 
+    # IMPORTANTE: preenchemos os DOIS campos (ICMS e FECP) antes de clicar em
+    # qualquer botão "OK". O cálculo do portal roda via uma única chamada
+    # AJAX (pfEmitirDocumento.calcularValorICMS) que lê o valor atual de
+    # AMBOS os campos no momento do clique - se clicarmos em "okIcms" com o
+    # campo FECP ainda vazio, o portal calcula o total de FECP como 0,00
+    # (foi exatamente isso que aconteceu num teste real: ICMS bateu, FECP
+    # veio zerado). Preencher os dois primeiro evita essa divergência.
     print("9. Preenchendo ICMS Informado...")
     campo_icms = wait.until(EC.element_to_be_clickable((By.ID, "txtIcmsInformado")))
     campo_icms.clear()
     campo_icms.send_keys(icms_informado_str)
-    driver.find_element(By.ID, "okIcms").click()
-
-    wait.until(lambda d: d.find_element(By.ID, "txtTotalIcms").get_attribute("value").strip() != "")
 
     print("10. Preenchendo FECP Informado...")
     campo_fecp = wait.until(EC.element_to_be_clickable((By.ID, "txtFecpInformado")))
     campo_fecp.clear()
     campo_fecp.send_keys(fecp_informado_str)
+
+    print("10.1. Confirmando os valores (ICMS e FECP) para o portal calcular os totais...")
+    driver.find_element(By.ID, "okIcms").click()
+    time.sleep(0.5)
     driver.find_element(By.ID, "okFecp").click()
 
+    wait.until(lambda d: d.find_element(By.ID, "txtTotalIcms").get_attribute("value").strip() != "")
     wait.until(lambda d: d.find_element(By.ID, "txtTotalFecp").get_attribute("value").strip() != "")
 
     # ==========================================================================
@@ -496,6 +505,11 @@ try:
     # ==========================================================================
     total_icms_dom = extrair_float_limpo(driver.find_element(By.ID, "txtTotalIcms").get_attribute("value"))
     total_fecp_dom = extrair_float_limpo(driver.find_element(By.ID, "txtTotalFecp").get_attribute("value"))
+
+    print(f"   -> (debug) valor bruto txtIcmsInformado no campo: {driver.find_element(By.ID, 'txtIcmsInformado').get_attribute('value')!r}")
+    print(f"   -> (debug) valor bruto txtFecpInformado no campo: {driver.find_element(By.ID, 'txtFecpInformado').get_attribute('value')!r}")
+    print(f"   -> (debug) valor bruto txtTotalIcms no campo: {driver.find_element(By.ID, 'txtTotalIcms').get_attribute('value')!r}")
+    print(f"   -> (debug) valor bruto txtTotalFecp no campo: {driver.find_element(By.ID, 'txtTotalFecp').get_attribute('value')!r}")
 
     print("🔒 AUDITORIA DE SEGURANÇA PRÉ-CONFIRMAÇÃO:")
     print(f"   -> ICMS (DARJ Normal) planilha: R$ {darj_normal_float:.2f} | Total ICMS no portal: R$ {total_icms_dom:.2f}")
