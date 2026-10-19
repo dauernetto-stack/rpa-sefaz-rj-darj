@@ -135,11 +135,48 @@ def calcular_datas_pagamento_vencimento(dt_entrada, hoje, feriados):
 
 
 def dump_debug(driver, tag):
-    """Salva screenshot + HTML da página no momento da falha, para diagnóstico."""
-    driver.save_screenshot(f"debug_{tag}.png")
-    with open(f"debug_{tag}.html", "w", encoding="utf-8") as f:
-        f.write(driver.page_source)
+    """Salva screenshot + HTML da página no momento da falha, para diagnóstico.
+
+    Além de salvar os arquivos (que viram artefato do GitHub Actions - difícil
+    de baixar de alguns ambientes), imprime no próprio log de texto do Actions
+    diagnósticos essenciais: URL atual, título da página e um trecho do HTML,
+    checando também sinais comuns de bloqueio/geobloqueio/WAF que sites
+    gov.br costumam aplicar contra IPs de datacenter (como os runners do
+    GitHub Actions, que não são IPs brasileiros).
+    """
+    try:
+        driver.save_screenshot(f"debug_{tag}.png")
+    except Exception as e:
+        print(f"   -> Não foi possível salvar o screenshot: {e}")
+    try:
+        html_atual = driver.page_source
+        with open(f"debug_{tag}.html", "w", encoding="utf-8") as f:
+            f.write(html_atual)
+    except Exception as e:
+        html_atual = ""
+        print(f"   -> Não foi possível salvar o HTML: {e}")
+
     print(f"   -> Screenshot e HTML salvos como debug_{tag}.png / debug_{tag}.html")
+
+    try:
+        print(f"   -> URL atual: {driver.current_url}")
+        print(f"   -> Título da página: {driver.title!r}")
+    except Exception as e:
+        print(f"   -> Não foi possível ler URL/título: {e}")
+
+    if html_atual:
+        texto_html_lower = html_atual.lower()
+        sinais_bloqueio = [
+            "access denied", "acesso negado", "forbidden", "blocked",
+            "captcha", "recaptcha", "cloudflare", "incapsula", "imperva",
+            "akamai", "bot detection", "unusual traffic", "bloqueado",
+            "não autorizado", "security check", "waf",
+        ]
+        encontrados = [s for s in sinais_bloqueio if s in texto_html_lower]
+        if encontrados:
+            print(f"   -> ATENÇÃO: possíveis sinais de bloqueio/WAF/geobloqueio no HTML: {encontrados}")
+        trecho = re.sub(r'\s+', ' ', html_atual).strip()[:1500]
+        print(f"   -> Trecho do HTML (primeiros 1500 caracteres, espaços colapsados): {trecho}")
 
 
 def enviar_pdf_para_drive(caminho_arquivo, folder_id, credenciais):
@@ -363,7 +400,7 @@ driver.execute_cdp_cmd("Page.setDownloadBehavior", {
     "downloadPath": diretorio_download
 })
 
-wait = WebDriverWait(driver, 20)
+wait = WebDriverWait(driver, 30)
 
 # ==============================================================================
 # FASE 3: NAVEGAÇÃO E PREENCHIMENTO DO FORMULÁRIO
@@ -372,6 +409,7 @@ wait = WebDriverWait(driver, 20)
 try:
     print("1. Acessando o Portal de Pagamentos da SEFAZ-RJ...")
     driver.get("https://www1.fazenda.rj.gov.br/portaldepagamentos/")
+    print(f"   -> Página carregada. URL atual: {driver.current_url} | Título: {driver.title!r}")
 
     print("2. Selecionando Tipo de Pagamento = ICMS/FECP...")
     select_tipo_pagamento = Select(wait.until(EC.element_to_be_clickable((By.ID, "tipoPagamentoLista"))))
