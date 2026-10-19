@@ -216,8 +216,20 @@ def dump_debug(driver, tag):
     try:
         print(f"   -> URL atual: {driver.current_url}")
         print(f"   -> Título da página: {driver.title!r}")
+        print(f"   -> Nº de janelas/abas abertas: {len(driver.window_handles)}")
     except Exception as e:
-        print(f"   -> Não foi possível ler URL/título: {e}")
+        print(f"   -> Não foi possível ler URL/título/janelas: {e}")
+
+    # Texto VISÍVEL da página (innerText) - muito mais fácil de ler do que o
+    # HTML cru para notar se um modal/diálogo de confirmação está na tela
+    # (ex.: "Deseja confirmar o item?", "Tem certeza?") que o seletor atual
+    # não reconhece.
+    try:
+        texto_visivel = driver.execute_script("return document.body.innerText;") or ""
+        texto_visivel_limpo = re.sub(r'\n{2,}', '\n', texto_visivel).strip()[:3000]
+        print(f"   -> Texto VISÍVEL da página (innerText, primeiros 3000 caracteres):\n{texto_visivel_limpo}")
+    except Exception as e:
+        print(f"   -> Não foi possível ler o innerText da página: {e}")
 
     if html_atual:
         texto_html_lower = html_atual.lower()
@@ -230,8 +242,17 @@ def dump_debug(driver, tag):
         encontrados = [s for s in sinais_bloqueio if s in texto_html_lower]
         if encontrados:
             print(f"   -> ATENÇÃO: possíveis sinais de bloqueio/WAF/geobloqueio no HTML: {encontrados}")
-        trecho = re.sub(r'\s+', ' ', html_atual).strip()[:1500]
-        print(f"   -> Trecho do HTML (primeiros 1500 caracteres, espaços colapsados): {trecho}")
+
+        sinais_dialogo = [
+            "confirma", "tem certeza", "deseja", "atenção", "modal", "dialog",
+            "aguarde", "processando", "carregando",
+        ]
+        encontrados_dialogo = [s for s in sinais_dialogo if s in texto_html_lower]
+        if encontrados_dialogo:
+            print(f"   -> Possíveis indícios de modal/diálogo/carregamento no HTML: {encontrados_dialogo}")
+
+        trecho = re.sub(r'\s+', ' ', html_atual).strip()[:4000]
+        print(f"   -> Trecho do HTML (primeiros 4000 caracteres, espaços colapsados): {trecho}")
 
 
 def enviar_pdf_para_drive(caminho_arquivo, folder_id, credenciais):
