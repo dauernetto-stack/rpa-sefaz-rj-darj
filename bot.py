@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import traceback
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -22,6 +23,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException,
+    UnexpectedAlertPresentException,
+    NoAlertPresentException,
+)
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ==============================================================================
@@ -158,6 +164,27 @@ def calcular_datas_pagamento_vencimento(dt_entrada, hoje, feriados):
     return data_pagamento, data_vencimento
 
 
+def descartar_alerta_nativo_se_existir(driver):
+    """Fecha um alert() nativo do navegador, se houver um aberto no momento.
+
+    O portal da SEFAZ-RJ ocasionalmente dispara um alert() nativo (ex.:
+    "Invalid reply from server") quando uma chamada AJAX dele falha no
+    lado do servidor deles - um problema transitório do site, não do
+    nosso código. Enquanto esse alert está aberto, qualquer interação do
+    Selenium com a página (find_element, screenshot, etc.) lança
+    UnexpectedAlertPresentException, então é importante conseguir
+    descartá-lo para seguir com o diagnóstico ou uma nova tentativa.
+    Retorna o texto do alerta (ou None se não havia nenhum aberto).
+    """
+    try:
+        alerta = driver.switch_to.alert
+        texto = alerta.text
+        alerta.accept()
+        return texto
+    except NoAlertPresentException:
+        return None
+
+
 def dump_debug(driver, tag):
     """Salva screenshot + HTML da página no momento da falha, para diagnóstico.
 
@@ -168,6 +195,10 @@ def dump_debug(driver, tag):
     gov.br costumam aplicar contra IPs de datacenter (como os runners do
     GitHub Actions, que não são IPs brasileiros).
     """
+    texto_alerta = descartar_alerta_nativo_se_existir(driver)
+    if texto_alerta is not None:
+        print(f"   -> Havia um alert() nativo aberto (descartado para prosseguir): {texto_alerta!r}")
+
     try:
         driver.save_screenshot(f"debug_{tag}.png")
     except Exception as e:
@@ -464,20 +495,41 @@ try:
     time.sleep(0.5)
 
     print("5. Preenchendo CNPJ e confirmando dados cadastrais...")
-    campo_cnpj = wait.until(EC.element_to_be_clickable((By.ID, "txtCnpjCpf")))
-    campo_cnpj.clear()
-    campo_cnpj.send_keys(CNPJ_RESPONSAVEL)
-    driver.find_element(By.ID, "btnConfirmar").click()
+    # O portal já exibiu um alert() nativo transitório de servidor ("Invalid
+    # reply from server") nessa consulta em pelo menos um teste real - a
+    # mesma etapa funcionou normalmente minutos antes e depois, então
+    # tentamos de novo uma vez (preenchendo o CNPJ do zero) antes de desistir.
+    insc_estadual_lida = ""
+    razao_social_lida = ""
+    ultimo_erro_lookup = None
+    for tentativa_cnpj in range(1, 3):
+        try:
+            campo_cnpj = wait.until(EC.element_to_be_clickable((By.ID, "txtCnpjCpf")))
+            campo_cnpj.clear()
+            campo_cnpj.send_keys(CNPJ_RESPONSAVEL)
+            driver.find_element(By.ID, "btnConfirmar").click()
 
-    # Auditoria: confirma que o lookup por CNPJ realmente trouxe Inscrição Estadual/Razão Social
-    wait.until(lambda d: d.find_element(By.ID, "txtInscEstadual").get_attribute("value").strip() != "")
-    insc_estadual_lida = driver.find_element(By.ID, "txtInscEstadual").get_attribute("value").strip()
-    razao_social_lida = driver.find_element(By.ID, "txtNomeRazaoSocial").get_attribute("value").strip()
+            # Auditoria: confirma que o lookup por CNPJ realmente trouxe Inscrição Estadual/Razão Social
+            wait.until(lambda d: d.find_element(By.ID, "txtInscEstadual").get_attribute("value").strip() != "")
+            insc_estadual_lida = driver.find_element(By.ID, "txtInscEstadual").get_attribute("value").strip()
+            razao_social_lida = driver.find_element(By.ID, "txtNomeRazaoSocial").get_attribute("value").strip()
+            break
+        except (TimeoutException, UnexpectedAlertPresentException, AttributeError) as e:
+            ultimo_erro_lookup = e
+            texto_alerta = descartar_alerta_nativo_se_existir(driver)
+            print(
+                f"   -> Tentativa {tentativa_cnpj} da consulta de CNPJ falhou "
+                f"({type(e).__name__}: {e}); alert() nativo encontrado: {texto_alerta!r}. "
+                f"{'Tentando novamente...' if tentativa_cnpj == 1 else 'Sem mais tentativas.'}"
+            )
+            time.sleep(2)
+
     print(f"   -> Inscrição Estadual-RJ: {insc_estadual_lida} | Razão Social: {razao_social_lida}")
 
     if not insc_estadual_lida or not razao_social_lida:
         dump_debug(driver, "erro_lookup_cnpj")
-        raise Exception("❌ ERRO CRÍTICO: O CNPJ não retornou Inscrição Estadual/Razão Social. Abortando!")
+        detalhe = f" Último erro: {type(ultimo_erro_lookup).__name__}: {ultimo_erro_lookup}" if ultimo_erro_lookup else ""
+        raise Exception(f"❌ ERRO CRÍTICO: O CNPJ não retornou Inscrição Estadual/Razão Social. Abortando!{detalhe}")
 
     print("6. Preenchendo Período de Referência...")
     campo_periodo = wait.until(EC.element_to_be_clickable((By.ID, "txtPeriodo")))
@@ -668,6 +720,8 @@ try:
 
 except Exception as erro:
     print(f"Ocorreu um erro na automação: {type(erro).__name__}: {erro}")
+    print("   -> Traceback completo:")
+    traceback.print_exc()
     dump_debug(driver, "erro_execucao")
 
 finally:
