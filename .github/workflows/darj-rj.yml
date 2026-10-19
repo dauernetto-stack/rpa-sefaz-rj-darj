@@ -10,12 +10,16 @@ on:
 jobs:
   emitir-darj:
     # IMPORTANTE: o site da SEFAZ-RJ bloqueia acessos vindos de IPs de
-    # datacenter/nuvem (inclusive os runners hospedados pelo GitHub, que
-    # rodam no Azure). Por isso este job roda num runner "self-hosted" -
-    # uma máquina sua, dentro de uma rede brasileira "normal" (não um IP
-    # de provedor de nuvem), com o agente do GitHub Actions instalado e
-    # rodando como serviço. Veja o README para o passo a passo de
-    # instalação do runner.
+    # datacenter/nuvem fora do Brasil (confirmado em teste real: o runner
+    # padrão do GitHub, hospedado no Azure, foi bloqueado). Por isso este
+    # job roda num runner "self-hosted": uma VM Linux (Debian 12) no GCP,
+    # na região São Paulo, com o agente do GitHub Actions rodando como
+    # serviço. Veja o README para o passo a passo de instalação do runner.
+    #
+    # Essa VM já vem com Python 3 e Google Chrome pré-instalados (feitos
+    # na configuração inicial do runner), por isso não usamos a action
+    # actions/setup-python aqui - ela não tem build pré-compilado para
+    # Debian 12 em runners self-hosted.
     runs-on: self-hosted
     timeout-minutes: 15
 
@@ -23,33 +27,23 @@ jobs:
       - name: Checkout do repositório
         uses: actions/checkout@v4
 
-      - name: Configura Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: Instala dependências Python
-        run: pip install -r requirements.txt
+        # --break-system-packages é necessário no Debian 12, que protege o
+        # Python do sistema (PEP 668) contra "pip install" direto.
+        run: python3 -m pip install --break-system-packages -r requirements.txt
 
-      - name: Instala o Google Chrome
+      - name: Instala/atualiza o Google Chrome
         uses: browser-actions/setup-chrome@v1
 
       - name: Escreve credenciais.json a partir do secret (nunca commitado)
         env:
           GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
-        # Usamos Python (em vez de bash) aqui porque o runner self-hosted
-        # pode ser Windows, onde o shell padrão (PowerShell) não tem o
-        # comando "base64" nativo - Python funciona igual nos dois SOs.
-        shell: python
-        run: |
-          import os, base64
-          with open("credenciais.json", "wb") as f:
-              f.write(base64.b64decode(os.environ["GOOGLE_CREDENTIALS_B64"]))
+        run: echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > credenciais.json
 
       - name: Roda o robô de emissão do DARJ
         env:
           HEADLESS: "true"
-        run: python bot.py
+        run: python3 bot.py
 
       - name: Salva screenshots/HTML de debug como artefato (se houver)
         if: always()
@@ -71,15 +65,7 @@ jobs:
         # enviados como artefato no passo anterior) e os PDFs baixados
         # localmente (já enviados ao Google Drive pelo próprio bot.py).
         if: always()
-        shell: python
         run: |
-          import glob, os, shutil
-
-          if os.path.exists("credenciais.json"):
-              os.remove("credenciais.json")
-
-          for arquivo in glob.glob("debug_*.png") + glob.glob("debug_*.html"):
-              os.remove(arquivo)
-
-          if os.path.isdir("downloads_darj"):
-              shutil.rmtree("downloads_darj")
+          rm -f credenciais.json
+          rm -f debug_*.png debug_*.html
+          rm -rf downloads_darj

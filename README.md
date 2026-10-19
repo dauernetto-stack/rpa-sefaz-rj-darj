@@ -96,50 +96,67 @@ também pode ser disparado manualmente a qualquer momento, pela aba
 
 ### ⚠️ Por que precisa de um runner self-hosted
 
-O site da SEFAZ-RJ bloqueia acessos vindos de IPs de datacenter/nuvem — isso
-foi confirmado num teste real: ao rodar no runner padrão do GitHub (hospedado
-no Azure), a página retornou o título **"Acesso bloqueado e/ou negado"**
-antes mesmo de o formulário carregar. Por isso o workflow está configurado
-com `runs-on: self-hosted`: ele roda numa máquina sua, numa rede brasileira
-"normal" (não um IP de provedor de nuvem), em vez de um runner do GitHub.
+O site da SEFAZ-RJ bloqueia acessos vindos de IPs de datacenter/nuvem fora
+do Brasil — isso foi confirmado em dois testes reais: o runner padrão do
+GitHub (hospedado no Azure, fora do Brasil) foi bloqueado (a página
+retornou o título "Acesso bloqueado e/ou negado"), enquanto uma VM na
+região `southamerica-east1` (São Paulo) do Google Cloud acessou o site
+normalmente. Por isso o workflow está configurado com `runs-on:
+self-hosted`.
 
 O agendamento, os segredos e os logs continuam 100% geridos pelo GitHub -
-só a execução em si acontece na sua máquina. Ela precisa ficar ligada,
+só a execução em si acontece numa VM dedicada. Ela precisa ficar ligada,
 online e com o agente do runner rodando no horário agendado (08:00, dias
 úteis).
 
-### 1. Instalar o runner self-hosted na sua máquina (uma vez só)
+### Infraestrutura atual (já configurada)
 
-Qualquer computador com acesso à internet "normal" (seu PC da empresa, uma
-VPS brasileira de um provedor comum, etc. - evite provedores de nuvem
-conhecidos como AWS/Azure/GCP, que têm mais chance de cair no mesmo
-bloqueio) serve. Esse computador precisa ter o Google Chrome já instalado
-e, de preferência, ficar ligado o tempo todo.
+O runner self-hosted deste repositório já está em produção, rodando numa
+VM no Google Cloud:
+
+| Item | Valor |
+|---|---|
+| Projeto GCP | `rpa-guias-dare-dae` |
+| Nome da VM | `rpa-sefaz-rj-runner` |
+| Zona | `southamerica-east1-a` (São Paulo) |
+| Tipo de máquina | `e2-medium` |
+| SO | Debian 12, com Python 3 e Google Chrome pré-instalados |
+| Nome do runner no GitHub | `gcp-sao-paulo-sefaz` |
+| Labels | `self-hosted, linux, x64, gcp-brazil` |
+| Execução | Instalado como serviço systemd (`actions-runner.*`), sobrevive a reboot |
+
+Para parar de cobrar pela VM temporariamente (por exemplo, enquanto o
+processo não está em uso), pare a instância pelo
+[console do GCP](https://console.cloud.google.com/compute/instances?project=rpa-guias-dare-dae)
+ou via `gcloud compute instances stop rpa-sefaz-rj-runner --zone=southamerica-east1-a`
+- e lembre de ligá-la (`instances start`) antes do próximo horário agendado,
+já que o workflow só roda quando o runner está online.
+
+### Instalando um runner do zero (caso precise recriar ou usar outra máquina)
+
+Qualquer computador Linux com acesso à internet dentro do Brasil (uma VM
+do GCP/AWS/Azure na região São Paulo também funciona, como já demonstrado -
+o bloqueio da SEFAZ-RJ parece ser por geolocalização, não por IP de nuvem
+em si) serve, desde que tenha Python 3 e Google Chrome instalados e fique
+ligado continuamente.
 
 1. No GitHub: **Settings → Actions → Runners → New self-hosted runner**.
-2. Escolha o sistema operacional da máquina (Windows ou Linux) e a
-   arquitetura (geralmente x64).
+2. Escolha **Linux** e a arquitetura **x64**.
 3. A própria página do GitHub vai gerar um bloco de comandos específico
    para esse repositório, com um token temporário. Copie e cole esses
    comandos no terminal da máquina escolhida, na ordem que aparecem
-   (baixar o pacote do runner, extrair, e rodar `config.cmd`/`config.sh`
-   com a URL e o token exibidos na tela).
-4. Durante o `config`, quando perguntado o nome do grupo/labels, pode
+   (baixar o pacote do runner, extrair, e rodar `config.sh` com a URL e o
+   token exibidos na tela).
+4. Durante o `config.sh`, quando perguntado o nome do grupo/labels, pode
    aceitar os valores padrão (a label `self-hosted` já é adicionada
    automaticamente, e é ela que o workflow usa).
 5. Para o runner ficar rodando sempre, mesmo após reiniciar a máquina ou
-   fechar a sessão, instale-o como serviço em vez de rodar
-   `run.cmd`/`run.sh` manualmente:
-   - **Windows** (no mesmo terminal, dentro da pasta do runner):
-     ```powershell
-     .\svc install
-     .\svc start
-     ```
-   - **Linux**:
-     ```bash
-     sudo ./svc.sh install
-     sudo ./svc.sh start
-     ```
+   fechar a sessão, instale-o como serviço em vez de rodar `run.sh`
+   manualmente:
+   ```bash
+   sudo ./svc.sh install
+   sudo ./svc.sh start
+   ```
 6. Confirme que o runner aparece como **"Idle"** (verde) em
    **Settings → Actions → Runners** no GitHub.
 
