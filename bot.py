@@ -200,12 +200,16 @@ client = gspread.authorize(creds)
 
 planilha = client.open_by_key(ID_PLANILHA).sheet1
 
-# Lemos os valores "crus" (em vez de usar get_all_records) porque a planilha
-# tem colunas extras sem cabeçalho (células em branco na linha 1) à direita
-# dos dados reais - o gspread trava com "header row contains duplicates: ['']"
-# quando há mais de uma coluna com cabeçalho vazio.
+# Lemos os valores "crus" (em vez de usar get_all_records) por dois motivos:
+# 1) a planilha tem uma linha de TÍTULO na linha 1 ("Pagamento Antecipado
+#    pela COBRA" + "Cod. 023-0"/"Cod. 750-1") e os cabeçalhos de coluna de
+#    verdade ("Data entrada", "Nº Nota Fiscal", ...) só aparecem na linha 2;
+# 2) além disso há colunas extras sem cabeçalho (células em branco) à
+#    direita dos dados reais - o gspread trava com "header row contains
+#    duplicates: ['']" quando há mais de uma coluna com cabeçalho vazio.
 _todos_valores = planilha.get_all_values(value_render_option='FORMATTED_VALUE')
-_cabecalhos_brutos = _todos_valores[0] if _todos_valores else []
+_LINHA_CABECALHO = 2  # cabeçalhos reais das colunas ficam na linha 2 da planilha
+_cabecalhos_brutos = _todos_valores[_LINHA_CABECALHO - 1] if len(_todos_valores) >= _LINHA_CABECALHO else []
 
 # Deduplica/preenche cabeçalhos vazios ou repetidos para podermos montar os
 # registros como dicionários sem conflito de chave.
@@ -223,7 +227,7 @@ for _idx, _h in enumerate(_cabecalhos_brutos):
     _cabecalhos_unicos.append(_h)
 
 registros = []
-for _linha in _todos_valores[1:]:
+for _linha in _todos_valores[_LINHA_CABECALHO:]:
     # ignora linhas totalmente em branco
     if not any(str(v).strip() for v in _linha):
         continue
@@ -246,7 +250,7 @@ for i, registro in enumerate(registros):
     except Exception:
         continue
     if dt_entrada.date() == d_menos_1.date() and str(registro.get('PROC DARJ', '')).strip() == '':
-        linha_alvo_index = i + 2
+        linha_alvo_index = i + _LINHA_CABECALHO + 1
         dados_alvo = registro
         dt_entrada_alvo = dt_entrada
         break
@@ -257,7 +261,7 @@ if not dados_alvo:
 
 print(f"Registro encontrado na linha {linha_alvo_index}. Nota Fiscal: {dados_alvo.get('Nº Nota Fiscal')}")
 
-cabecalhos = [str(v).strip() for v in planilha.row_values(1)]
+cabecalhos = [str(v).strip() for v in planilha.row_values(_LINHA_CABECALHO)]
 
 
 def encontrar_coluna(termos_possiveis, nome_padrao):
