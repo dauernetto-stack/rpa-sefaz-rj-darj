@@ -7,10 +7,22 @@ da SEFAZ-RJ (`https://www1.fazenda.rj.gov.br/portaldepagamentos/`), gera a
 guia, salva o PDF na pasta do Google Drive da equipe e grava os dados da guia
 de volta na planilha.
 
-**Este robô roda de forma 100% automática no GitHub Actions** (serverless,
-sem precisar de nenhuma estação/computador ligado) — veja a seção
-[Rodando no GitHub Actions](#rodando-no-github-actions-recomendado--serverless)
-abaixo. Também é possível rodar localmente (seção
+**Este robô roda de forma automática via GitHub Actions** (agendamento,
+segredos e logs centralizados no GitHub) — veja a seção
+[Rodando no GitHub Actions](#rodando-no-github-actions)
+abaixo.
+
+> ⚠️ **Importante - por que não é 100% "serverless":** o site da SEFAZ-RJ
+> bloqueia acessos vindos de IPs de datacenter/nuvem (confirmado em teste
+> real - a página retorna "Acesso bloqueado e/ou negado" quando acessada
+> pelos runners padrão, hospedados pelo GitHub no Azure). Por isso o
+> workflow roda num **runner "self-hosted"**: uma máquina sua, numa rede
+> brasileira comum (não um IP de provedor de nuvem), com o agente do
+> GitHub Actions instalado como serviço. O agendamento, os segredos e os
+> logs continuam 100% geridos pelo GitHub - só a execução em si acontece
+> numa máquina sua, que precisa ficar ligada e online no horário agendado.
+
+Também é possível rodar localmente sem o GitHub Actions (seção
 [Rodando manualmente](#rodando-manualmente)), por exemplo para depurar
 visualmente a primeira execução.
 
@@ -75,19 +87,70 @@ Em caso de erro, o script salva automaticamente `debug_<etapa>.png` e
 `debug_<etapa>.html` na pasta do projeto, com um retrato exato da tela no
 momento da falha — isso é o primeiro lugar a olhar para diagnosticar.
 
-## Rodando no GitHub Actions (recomendado — serverless)
+## Rodando no GitHub Actions
 
 O repositório já inclui o workflow `.github/workflows/darj-rj.yml`, que roda
-o robô automaticamente todo dia útil às 08:00 (horário de Brasília), direto
-num runner do GitHub — sem precisar de computador nenhum ligado. Ele também
-pode ser disparado manualmente a qualquer momento.
+o robô automaticamente todo dia útil às 08:00 (horário de Brasília). Ele
+também pode ser disparado manualmente a qualquer momento, pela aba
+**Actions** do repositório.
 
-### 1. Gerar o secret da credencial do Google (uma vez só)
+### ⚠️ Por que precisa de um runner self-hosted
+
+O site da SEFAZ-RJ bloqueia acessos vindos de IPs de datacenter/nuvem — isso
+foi confirmado num teste real: ao rodar no runner padrão do GitHub (hospedado
+no Azure), a página retornou o título **"Acesso bloqueado e/ou negado"**
+antes mesmo de o formulário carregar. Por isso o workflow está configurado
+com `runs-on: self-hosted`: ele roda numa máquina sua, numa rede brasileira
+"normal" (não um IP de provedor de nuvem), em vez de um runner do GitHub.
+
+O agendamento, os segredos e os logs continuam 100% geridos pelo GitHub -
+só a execução em si acontece na sua máquina. Ela precisa ficar ligada,
+online e com o agente do runner rodando no horário agendado (08:00, dias
+úteis).
+
+### 1. Instalar o runner self-hosted na sua máquina (uma vez só)
+
+Qualquer computador com acesso à internet "normal" (seu PC da empresa, uma
+VPS brasileira de um provedor comum, etc. - evite provedores de nuvem
+conhecidos como AWS/Azure/GCP, que têm mais chance de cair no mesmo
+bloqueio) serve. Esse computador precisa ter o Google Chrome já instalado
+e, de preferência, ficar ligado o tempo todo.
+
+1. No GitHub: **Settings → Actions → Runners → New self-hosted runner**.
+2. Escolha o sistema operacional da máquina (Windows ou Linux) e a
+   arquitetura (geralmente x64).
+3. A própria página do GitHub vai gerar um bloco de comandos específico
+   para esse repositório, com um token temporário. Copie e cole esses
+   comandos no terminal da máquina escolhida, na ordem que aparecem
+   (baixar o pacote do runner, extrair, e rodar `config.cmd`/`config.sh`
+   com a URL e o token exibidos na tela).
+4. Durante o `config`, quando perguntado o nome do grupo/labels, pode
+   aceitar os valores padrão (a label `self-hosted` já é adicionada
+   automaticamente, e é ela que o workflow usa).
+5. Para o runner ficar rodando sempre, mesmo após reiniciar a máquina ou
+   fechar a sessão, instale-o como serviço em vez de rodar
+   `run.cmd`/`run.sh` manualmente:
+   - **Windows** (no mesmo terminal, dentro da pasta do runner):
+     ```powershell
+     .\svc install
+     .\svc start
+     ```
+   - **Linux**:
+     ```bash
+     sudo ./svc.sh install
+     sudo ./svc.sh start
+     ```
+6. Confirme que o runner aparece como **"Idle"** (verde) em
+   **Settings → Actions → Runners** no GitHub.
+
+### 2. Gerar o secret da credencial do Google (uma vez só)
 
 O `credenciais.json` real **nunca** vai para o repositório (ele está no
 `.gitignore`). Em vez disso, ele é guardado como um *Secret* criptografado do
-GitHub e escrito em disco só durante a execução do workflow, dentro do
-runner descartável.
+GitHub e escrito em disco só durante a execução do workflow - e removido
+automaticamente ao final de cada execução (veja o passo "Limpeza" no
+workflow), já que a máquina self-hosted não é descartada como um runner do
+GitHub.
 
 Com o arquivo `credenciais.json` (a chave da service account
 `guias-dare-dae@rpa-guias-dare-dae.iam.gserviceaccount.com`) em mãos, gere a
@@ -104,7 +167,7 @@ base64 -w0 credenciais.json
 
 Copie a string gigante que isso gerar (sem quebras de linha).
 
-### 2. Cadastrar o secret no repositório
+### 3. Cadastrar o secret no repositório
 
 No GitHub: **Settings → Secrets and variables → Actions → New repository
 secret**.
@@ -112,19 +175,23 @@ secret**.
 - Nome: `GOOGLE_CREDENTIALS_B64`
 - Valor: cole a string em base64 gerada no passo anterior
 
-### 3. Pronto
+### 4. Pronto
 
 O workflow já está agendado (`cron: '0 11 * * 1-5'` = 08:00 em Brasília, seg
 a sex). Para rodar manualmente a qualquer momento: aba **Actions** do
 repositório → workflow "RPA DARJ-RJ (emissão automática)" → **Run workflow**.
 
 Se alguma etapa falhar, o workflow salva automaticamente um artefato
-(`debug-<id do run>`) com os screenshots/HTML de debug daquele momento —
-baixe esse artefato na própria página do run, em "Actions", pra diagnosticar.
+(`debug-<id do run>`) com os screenshots/HTML de debug daquele momento, e
+também imprime no próprio log de texto a URL, o título da página e um
+trecho do HTML no momento da falha (mais rápido de consultar do que baixar
+o artefato).
 
 > **Atenção:** o GitHub desativa automaticamente workflows agendados
 > (`schedule`) em repositórios sem nenhuma atividade (commits, etc.) por
 > 60 dias. Se isso acontecer, basta reativar manualmente na aba Actions.
+> Isso é independente do runner self-hosted, que pode continuar ligado
+> normalmente.
 
 ### Observação sobre downloads em modo headless
 

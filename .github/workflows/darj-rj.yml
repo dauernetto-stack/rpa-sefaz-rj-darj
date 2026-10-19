@@ -9,7 +9,14 @@ on:
 
 jobs:
   emitir-darj:
-    runs-on: ubuntu-latest
+    # IMPORTANTE: o site da SEFAZ-RJ bloqueia acessos vindos de IPs de
+    # datacenter/nuvem (inclusive os runners hospedados pelo GitHub, que
+    # rodam no Azure). Por isso este job roda num runner "self-hosted" -
+    # uma máquina sua, dentro de uma rede brasileira "normal" (não um IP
+    # de provedor de nuvem), com o agente do GitHub Actions instalado e
+    # rodando como serviço. Veja o README para o passo a passo de
+    # instalação do runner.
+    runs-on: self-hosted
     timeout-minutes: 15
 
     steps:
@@ -30,7 +37,14 @@ jobs:
       - name: Escreve credenciais.json a partir do secret (nunca commitado)
         env:
           GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
-        run: echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > credenciais.json
+        # Usamos Python (em vez de bash) aqui porque o runner self-hosted
+        # pode ser Windows, onde o shell padrão (PowerShell) não tem o
+        # comando "base64" nativo - Python funciona igual nos dois SOs.
+        shell: python
+        run: |
+          import os, base64
+          with open("credenciais.json", "wb") as f:
+              f.write(base64.b64decode(os.environ["GOOGLE_CREDENTIALS_B64"]))
 
       - name: Roda o robô de emissão do DARJ
         env:
@@ -47,3 +61,25 @@ jobs:
             debug_*.html
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Limpeza (credenciais, debug e downloads locais)
+        # Diferente do runner hospedado pelo GitHub (que é descartado
+        # inteiro após cada job), uma máquina self-hosted é persistente -
+        # então limpamos explicitamente ao final de toda execução, mesmo
+        # em caso de falha: a credencial (não deve ficar em texto puro no
+        # disco entre uma execução e outra), os arquivos de debug (já
+        # enviados como artefato no passo anterior) e os PDFs baixados
+        # localmente (já enviados ao Google Drive pelo próprio bot.py).
+        if: always()
+        shell: python
+        run: |
+          import glob, os, shutil
+
+          if os.path.exists("credenciais.json"):
+              os.remove("credenciais.json")
+
+          for arquivo in glob.glob("debug_*.png") + glob.glob("debug_*.html"):
+              os.remove(arquivo)
+
+          if os.path.isdir("downloads_darj"):
+              shutil.rmtree("downloads_darj")
