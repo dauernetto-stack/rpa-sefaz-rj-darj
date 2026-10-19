@@ -40,6 +40,18 @@ pip install -r requirements.txt
    e-mail da service account (campo `client_email` dentro do JSON) com
    permissão de **Editor**.
 
+## Verificando o acesso antes de rodar
+
+Depois de colocar o `credenciais.json` real na pasta, rode primeiro:
+
+```bash
+python testar_acesso.py
+```
+
+Esse script não abre navegador nem mexe em nada na SEFAZ - ele só confirma
+que a service account consegue ler a planilha e enxergar a pasta do Drive,
+e aponta exatamente qual compartilhamento está faltando caso dê erro.
+
 ## Rodando manualmente
 
 ```bash
