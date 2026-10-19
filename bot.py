@@ -80,6 +80,30 @@ def extrair_float_limpo(val_raw):
         return 0.0
 
 
+def aguardar_valor_estavel(driver, elemento_id, tentativas=20, intervalo=0.3):
+    """Espera o valor de um campo (preenchido via AJAX pelo portal) "estabilizar".
+
+    Só esperar o campo ficar não-vazio não é suficiente: o portal costuma
+    passar por um valor intermediário (ex.: "0,00") antes do AJAX terminar
+    e atualizar para o valor final - e se lermos nesse meio-tempo, pegamos
+    um total errado (foi exatamente o que aconteceu num teste real: o FECP
+    passou por "0,00" e só comparamos o deadline errado). Por isso lemos o
+    valor repetidamente até duas leituras consecutivas serem iguais e
+    não-vazias.
+    """
+    valor_anterior = None
+    for _ in range(tentativas):
+        valor_atual = driver.find_element(By.ID, elemento_id).get_attribute("value").strip()
+        if valor_atual != "" and valor_atual == valor_anterior:
+            return valor_atual
+        valor_anterior = valor_atual
+        time.sleep(intervalo)
+    # Não estabilizou dentro do tempo esperado - retorna o último valor lido
+    # mesmo assim; a auditoria de segurança (BLINDAGEM) mais adiante vai
+    # pegar qualquer divergência e abortar a emissão.
+    return valor_anterior or ""
+
+
 def formatar_valor_virgula(valor_float):
     """Formata float como string BR sem separador de milhar, ex: 146.85 -> '146,85'."""
     return f"{valor_float:.2f}".replace('.', ',')
@@ -500,16 +524,21 @@ try:
     wait.until(lambda d: d.find_element(By.ID, "txtTotalIcms").get_attribute("value").strip() != "")
     wait.until(lambda d: d.find_element(By.ID, "txtTotalFecp").get_attribute("value").strip() != "")
 
+    # Espera os campos ESTABILIZAREM (não só ficarem não-vazios) antes de ler
+    # os totais - veja o comentário de aguardar_valor_estavel() para o porquê.
+    valor_total_icms_raw = aguardar_valor_estavel(driver, "txtTotalIcms")
+    valor_total_fecp_raw = aguardar_valor_estavel(driver, "txtTotalFecp")
+
     # ==========================================================================
     # BLINDAGEM: AUDITORIA PÓS-PREENCHIMENTO
     # ==========================================================================
-    total_icms_dom = extrair_float_limpo(driver.find_element(By.ID, "txtTotalIcms").get_attribute("value"))
-    total_fecp_dom = extrair_float_limpo(driver.find_element(By.ID, "txtTotalFecp").get_attribute("value"))
+    total_icms_dom = extrair_float_limpo(valor_total_icms_raw)
+    total_fecp_dom = extrair_float_limpo(valor_total_fecp_raw)
 
     print(f"   -> (debug) valor bruto txtIcmsInformado no campo: {driver.find_element(By.ID, 'txtIcmsInformado').get_attribute('value')!r}")
     print(f"   -> (debug) valor bruto txtFecpInformado no campo: {driver.find_element(By.ID, 'txtFecpInformado').get_attribute('value')!r}")
-    print(f"   -> (debug) valor bruto txtTotalIcms no campo: {driver.find_element(By.ID, 'txtTotalIcms').get_attribute('value')!r}")
-    print(f"   -> (debug) valor bruto txtTotalFecp no campo: {driver.find_element(By.ID, 'txtTotalFecp').get_attribute('value')!r}")
+    print(f"   -> (debug) valor bruto txtTotalIcms no campo (estabilizado): {valor_total_icms_raw!r}")
+    print(f"   -> (debug) valor bruto txtTotalFecp no campo (estabilizado): {valor_total_fecp_raw!r}")
 
     print("🔒 AUDITORIA DE SEGURANÇA PRÉ-CONFIRMAÇÃO:")
     print(f"   -> ICMS (DARJ Normal) planilha: R$ {darj_normal_float:.2f} | Total ICMS no portal: R$ {total_icms_dom:.2f}")
