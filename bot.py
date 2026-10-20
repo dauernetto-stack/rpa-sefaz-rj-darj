@@ -667,8 +667,51 @@ def preencher_formulario_ate_auditoria(driver, wait):
     print("✅ VALIDAÇÃO DE SEGURANÇA CONCLUÍDA: Valores aprovados!")
 
 
+def confirmar_item_e_aguardar_resumo(driver, wait):
+    """Clica em 'Confirmar item' e espera a tela de Resumo de pagamento.
+
+    Esse clique dispara a função JS validarTipoPagamento() -> listarIEAtivas(),
+    que faz uma chamada AJAX/DWR ao backend para incluir o item; só DEPOIS
+    dessa inclusão ser confirmada pelo servidor (há até uma flag oculta
+    "exibirResumo" controlando isso) é que a tela de Resumo aparece. Ou
+    seja: se essa chamada falhar (já confirmamos, inclusive buscando um .js
+    estático do próprio portal de uma infraestrutura totalmente diferente,
+    que o WAF de reputação de IP do SEFAZ-RJ pode bloquear silenciosamente
+    chamadas como essa, sem mostrar erro nenhum na tela - o item nunca foi
+    incluído no servidor e nenhum documento foi gerado. Por isso essa etapa
+    é segura para entrar no mesmo retry-com-navegador-novo do preenchimento:
+    o ponto de não retorno real é só o clique em 'Gerar DARJ' (que de fato
+    gera o documento), não este aqui.
+    """
+    print("11. Clicando em 'Confirmar item'...")
+    btn_confirmar_item = wait.until(EC.element_to_be_clickable((
+        By.XPATH, "//input[@type='button' and contains(@value,'Confirmar item')]"
+    )))
+    btn_confirmar_item.click()
+    time.sleep(1.5)
+    fechar_modal_informacao_se_existir(driver)
+
+    print("12. Aguardando tela de Resumo de pagamento...")
+    wait.until(EC.presence_of_element_located((
+        By.XPATH, "//*[contains(text(),'Resumo de pagamento') or contains(text(),'Gerar DARJ')]"
+    )))
+
+    # Marca a checkbox do item, se existir
+    try:
+        checkboxes = driver.find_elements(By.XPATH, "//table//input[@type='checkbox']")
+        for cb in checkboxes:
+            if not cb.is_selected():
+                driver.execute_script("arguments[0].click();", cb)
+    except Exception:
+        pass
+
+    dump_debug(driver, "resumo_pagamento_pre_geracao")  # registro para auditoria, sempre salvo
+
+
 # ==============================================================================
-# FASE 3: NAVEGAÇÃO E PREENCHIMENTO DO FORMULÁRIO (com retry em falha transitória)
+# FASE 3: NAVEGAÇÃO, PREENCHIMENTO E CONFIRMAÇÃO DO ITEM (com retry em falha
+# transitória - tudo aqui é seguro de repetir do zero, pois nenhum documento
+# é gerado até o clique em "Gerar DARJ" na FASE 4 abaixo)
 # ==============================================================================
 
 MAX_TENTATIVAS_PREENCHIMENTO = 3
@@ -685,11 +728,12 @@ for tentativa in range(1, MAX_TENTATIVAS_PREENCHIMENTO + 1):
     driver, wait = criar_driver_chrome()
     try:
         preencher_formulario_ate_auditoria(driver, wait)
+        confirmar_item_e_aguardar_resumo(driver, wait)
         erro_preenchimento = None
         break
     except Exception as e:
         erro_preenchimento = e
-        print(f"⚠️ Tentativa {tentativa}/{MAX_TENTATIVAS_PREENCHIMENTO} de preenchimento do formulário falhou: {type(e).__name__}: {e}")
+        print(f"⚠️ Tentativa {tentativa}/{MAX_TENTATIVAS_PREENCHIMENTO} de preenchimento/confirmação do item falhou: {type(e).__name__}: {e}")
         traceback.print_exc()
         dump_debug(driver, f"erro_preenchimento_tentativa_{tentativa}")
         if tentativa < MAX_TENTATIVAS_PREENCHIMENTO:
@@ -702,33 +746,9 @@ if erro_preenchimento is not None:
         driver.quit()
 else:
     try:
-        print("11. Clicando em 'Confirmar item'...")
-        btn_confirmar_item = wait.until(EC.element_to_be_clickable((
-            By.XPATH, "//input[@type='button' and contains(@value,'Confirmar item')]"
-        )))
-        btn_confirmar_item.click()
-        time.sleep(1.5)
-        fechar_modal_informacao_se_existir(driver)
-
         # ==========================================================================
-        # FASE 4: RESUMO DE PAGAMENTO E GERAÇÃO DO DARJ
+        # FASE 4: GERAÇÃO DO DARJ (ponto de não retorno - tentativa única)
         # ==========================================================================
-        print("12. Aguardando tela de Resumo de pagamento...")
-        wait.until(EC.presence_of_element_located((
-            By.XPATH, "//*[contains(text(),'Resumo de pagamento') or contains(text(),'Gerar DARJ')]"
-        )))
-
-        # Marca a checkbox do item, se existir
-        try:
-            checkboxes = driver.find_elements(By.XPATH, "//table//input[@type='checkbox']")
-            for cb in checkboxes:
-                if not cb.is_selected():
-                    driver.execute_script("arguments[0].click();", cb)
-        except Exception:
-            pass
-
-        dump_debug(driver, "resumo_pagamento_pre_geracao")  # registro para auditoria, sempre salvo
-
         print("13. Clicando em 'Gerar DARJ'...")
         btn_gerar_darj = wait.until(EC.element_to_be_clickable((
             By.XPATH, "//input[@type='button' and contains(@value,'Gerar DARJ')] | //a[contains(.,'Gerar DARJ')]"
