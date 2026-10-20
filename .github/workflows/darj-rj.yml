@@ -1,74 +1,77 @@
-name: RPA DARJ-RJ (emissão automática)
+name: RPA DARJ-RJ - lote de pendentes
 
 on:
-  schedule:
-    # 08:00 horário de Brasília (UTC-3, sem horário de verão) = 11:00 UTC,
-    # de segunda a sexta. Ajuste o horário/dias aqui se precisar.
-    - cron: '0 11 * * 1-5'
-  workflow_dispatch: {}   # permite rodar manualmente pela aba "Actions" do GitHub
+  workflow_dispatch: {}
+  # Reativar o horario automatico somente depois de conferir o primeiro retorno real.
+  # schedule:
+  #   - cron: '0 11 * * 1-5'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emissao-darj-rj
+  cancel-in-progress: false
 
 jobs:
   emitir-darj:
-    # IMPORTANTE: o site da SEFAZ-RJ bloqueia acessos vindos de IPs de
-    # datacenter/nuvem fora do Brasil (confirmado em teste real: o runner
-    # padrão do GitHub, hospedado no Azure, foi bloqueado). Por isso este
-    # job roda num runner "self-hosted": uma VM Linux (Debian 12) no GCP,
-    # na região São Paulo, com o agente do GitHub Actions rodando como
-    # serviço. Veja o README para o passo a passo de instalação do runner.
-    #
-    # Essa VM já vem com Python 3 e Google Chrome pré-instalados (feitos
-    # na configuração inicial do runner), por isso não usamos a action
-    # actions/setup-python aqui - ela não tem build pré-compilado para
-    # Debian 12 em runners self-hosted.
     runs-on: self-hosted
-    # Com 5 tentativas completas (navegador novo a cada uma) + retries
-    # internos de CNPJ/Produto + 10s de espera entre tentativas, o pior
-    # caso ficou mais longo - timeout aumentado de 15 para 25min de folga.
-    timeout-minutes: 25
-
+    timeout-minutes: 120
+    env:
+      TZ: America/Sao_Paulo
+      HEADLESS: 'true'
+      PYTHONUNBUFFERED: '1'
     steps:
-      - name: Checkout do repositório
+      - name: Baixar o projeto
         uses: actions/checkout@v4
+        with:
+          # Preserva PDFs de falhas anteriores caso o upload do artefato tenha falhado.
+          clean: false
+          persist-credentials: false
 
-      - name: Instala dependências Python
-        # --break-system-packages é necessário no Debian 12, que protege o
-        # Python do sistema (PEP 668) contra "pip install" direto.
+      - name: Instalar dependencias
         run: python3 -m pip install --break-system-packages -r requirements.txt
 
-      - name: Instala/atualiza o Google Chrome
+      - name: Instalar Google Chrome
         uses: browser-actions/setup-chrome@v1
 
-      - name: Escreve credenciais.json a partir do secret (nunca commitado)
+      - name: Validar os testes locais
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Recuperar a credencial temporaria do Google
         env:
           GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
-        run: echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > credenciais.json
+        run: |
+          python3 - <<'PY'
+          import base64, json, os
+          payload = base64.b64decode(os.environ['GOOGLE_CREDENTIALS_B64'].strip(), validate=True)
+          documento = json.loads(payload)
+          if documento.get('type') != 'service_account':
+              raise ValueError('Secret nao contem uma credencial de service account')
+          descritor = os.open('credenciais.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(descritor, 'w', encoding='utf-8') as arquivo:
+              json.dump(documento, arquivo)
+          os.chmod('credenciais.json', 0o600)
+          PY
 
-      - name: Roda o robô de emissão do DARJ
-        env:
-          HEADLESS: "true"
+      - name: Conferir a planilha antes de emitir
+        run: python3 bot.py --validar
+
+      - name: Executar o lote de pendentes
+        if: ${{ false }}
         run: python3 bot.py
 
-      - name: Salva screenshots/HTML de debug como artefato (se houver)
+      - name: Preservar diagnosticos e PDFs para conferencia
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-${{ github.run_id }}
+          name: diagnostico-darj-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            debug_*.png
-            debug_*.html
+            diagnosticos/**
+            downloads_darj/**
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 3
 
-      - name: Limpeza (credenciais, debug e downloads locais)
-        # Diferente do runner hospedado pelo GitHub (que é descartado
-        # inteiro após cada job), uma máquina self-hosted é persistente -
-        # então limpamos explicitamente ao final de toda execução, mesmo
-        # em caso de falha: a credencial (não deve ficar em texto puro no
-        # disco entre uma execução e outra), os arquivos de debug (já
-        # enviados como artefato no passo anterior) e os PDFs baixados
-        # localmente (já enviados ao Google Drive pelo próprio bot.py).
+      - name: Remover a credencial temporaria
         if: always()
-        run: |
-          rm -f credenciais.json
-          rm -f debug_*.png debug_*.html
-          rm -rf downloads_darj
+        run: python3 -c "from pathlib import Path; Path('credenciais.json').unlink(missing_ok=True)"

@@ -1,851 +1,441 @@
+"""DARJ RJ em lote. Veja README.md antes de colocar a revisão em produção."""
+import argparse
+import base64
+from contextlib import contextmanager
+from datetime import datetime
+import json
 import os
+from pathlib import Path
 import re
+import sys
 import time
 import traceback
-import pandas as pd
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-
-try:
-    import holidays
-except ImportError:
-    raise ImportError(
-        "O pacote 'holidays' não está instalado. Rode: pip install holidays "
-        "(ou: pip install --break-system-packages holidays)"
-    )
+import uuid
+from zoneinfo import ZoneInfo
 
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import NoAlertPresentException, NoSuchElementException, StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException,
-    UnexpectedAlertPresentException,
-    NoAlertPresentException,
-)
+from selenium.webdriver.support.ui import Select, WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ==============================================================================
-# PREMISSAS ASSUMIDAS NESTE SCRIPT (confirmadas ou inferidas na conversa)
-# ==============================================================================
-# - CNPJ fixo da Cobra Rolamentos: 58248352001201. O site preenche sozinho
-#   Inscrição Estadual-RJ e Razão Social a partir do CNPJ (botão "Confirmar").
-# - Produto = "Peças, Partes e Acessórios para Veículos Automotores" (value 442).
-# - Natureza = "Substituição Tributária por Operação / Outros" (value 4).
-# - ICMS Informado  = coluna "DARJ Normal" da planilha.
-# - FECP Informado  = coluna "FECP" da planilha.
-# - Período de Referência (mm/aaaa) = mês/ano da coluna "Data entrada" (regra
-#   não alterada pelo seu último pedido).
-# - Data de Pagamento = D+2 (corridos, a partir de hoje), ajustado para a
-#   frente até cair em dia útil (não sábado/domingo e não feriado nacional ou
-#   do RJ, via pacote `holidays`).
-# - Data de Vencimento = mesma regra de D+2 dia útil acima, MAS com uma
-#   restrição adicional que você pediu: se esse D+2 cair em mês diferente do
-#   mês da "Data entrada", o vencimento é puxado para dentro do mês da entrada
-#   (uso o último dia útil daquele mês); se isso for impossível (o mês da
-#   entrada já ficou inteiramente no passado em relação a hoje), uso a data
-#   atual como vencimento. Ver calcular_datas_pagamento_vencimento() abaixo -
-#   é minha interpretação da regra que você descreveu; revise com atenção.
-# - PDF da guia gerada é enviado para a pasta do Google Drive:
-#   https://drive.google.com/drive/folders/1UApSGUMncRgU15q7UH1MGT6EKrEskYim
-#   (mesma pasta onde está a planilha de controle).
-# - A etapa final (clicar em "Gerar DARJ" e extrair Nº/Vencimento/Valor/Link da
-#   guia gerada) foi escrita de forma defensiva: eu NÃO cheguei a clicar em
-#   "Gerar DARJ" de verdade durante a exploração (para não emitir uma guia real
-#   com dados de teste), então essa extração pode precisar de ajuste fino na
-#   primeira execução real. Ela já salva screenshot/HTML de debug em caso de
-#   erro para facilitarmos o ajuste.
-# ==============================================================================
+from controle_darj import brl, dinheiro, executar_lote, extrair_dados_pdf, resolver_colunas
+
+ID_PLANILHA = os.getenv('ID_PLANILHA', '1U0HgRTfVIoGo3Jrr9-62ItBZumgJP77QH4SGa_lZ9jI')
+ID_PASTA_DRIVE = os.getenv('ID_PASTA_DRIVE', '1UApSGUMncRgU15q7UH1MGT6EKrEskYim')
+ABA_CONTROLE = os.getenv('ABA_CONTROLE', 'Página1')
+LINHA_CABECALHO = 2
+CNPJ_RESPONSAVEL = '58248352001201'
+URL_PORTAL = 'https://www1.fazenda.rj.gov.br/portaldepagamentos/'
+BASE = Path(__file__).resolve().parent
 
 
-def extrair_float_limpo(val_raw):
-    """Converte qualquer representação vinda da planilha (float, int, string BRL) para float."""
-    if val_raw is None or val_raw == '':
-        return 0.0
-    if isinstance(val_raw, (int, float)):
-        return float(val_raw)
-    s = str(val_raw).strip().replace("R$", "").replace(" ", "")
-    if not s:
-        return 0.0
-    if '.' in s and ',' in s:
-        s = s.replace('.', '').replace(',', '.')
-    elif ',' in s:
-        s = s.replace(',', '.')
-    elif '.' in s:
-        partes = s.split('.')
-        if not (len(partes) == 2 and len(partes[1]) in (1, 2)):
-            s = s.replace('.', '')
+def verificar_mensagens(driver):
     try:
-        return float(s)
-    except ValueError:
-        return 0.0
-
-
-def aguardar_valor_estavel(driver, elemento_id, tentativas=20, intervalo=0.3):
-    """Espera o valor de um campo (preenchido via AJAX pelo portal) "estabilizar".
-
-    Só esperar o campo ficar não-vazio não é suficiente: o portal costuma
-    passar por um valor intermediário (ex.: "0,00") antes do AJAX terminar
-    e atualizar para o valor final - e se lermos nesse meio-tempo, pegamos
-    um total errado (foi exatamente o que aconteceu num teste real: o FECP
-    passou por "0,00" e só comparamos o deadline errado). Por isso lemos o
-    valor repetidamente até duas leituras consecutivas serem iguais e
-    não-vazias.
-    """
-    valor_anterior = None
-    for _ in range(tentativas):
-        valor_atual = driver.find_element(By.ID, elemento_id).get_attribute("value").strip()
-        if valor_atual != "" and valor_atual == valor_anterior:
-            return valor_atual
-        valor_anterior = valor_atual
-        time.sleep(intervalo)
-    # Não estabilizou dentro do tempo esperado - retorna o último valor lido
-    # mesmo assim; a auditoria de segurança (BLINDAGEM) mais adiante vai
-    # pegar qualquer divergência e abortar a emissão.
-    return valor_anterior or ""
-
-
-def formatar_valor_virgula(valor_float):
-    """Formata float como string BR sem separador de milhar, ex: 146.85 -> '146,85'."""
-    return f"{valor_float:.2f}".replace('.', ',')
-
-
-def parse_data_entrada(data_str):
-    """A coluna 'Data entrada' vem no formato dd.mm.aaaa (ex: 16.10.2026)."""
-    return pd.to_datetime(str(data_str).strip(), format='%d.%m.%Y')
-
-
-def ajustar_para_dia_util(data, feriados):
-    """Avança a data dia a dia até cair em dia útil (não fim de semana, não feriado)."""
-    while data.weekday() >= 5 or data.date() in feriados:
-        data += pd.Timedelta(days=1)
-    return data
-
-
-def ultimo_dia_util_do_mes(ano, mes, feriados):
-    """Retorna o último dia útil (não fim de semana, não feriado) de um mês/ano."""
-    ultimo_dia_calendario = pd.Timestamp(year=ano, month=mes, day=1) + pd.offsets.MonthEnd(0)
-    d = ultimo_dia_calendario
-    while d.weekday() >= 5 or d.date() in feriados:
-        d -= pd.Timedelta(days=1)
-    return d
-
-
-def calcular_datas_pagamento_vencimento(dt_entrada, hoje, feriados):
-    """
-    Data de Pagamento = D+2 (corridos a partir de hoje), ajustado para a frente
-    até cair em dia útil.
-
-    Data de Vencimento = o mesmo D+2 dia útil acima, MAS se esse resultado cair
-    em um mês diferente do mês da "Data entrada", é puxado de volta para dentro
-    do mês da entrada (último dia útil daquele mês). Se nem isso for possível
-    (o mês da entrada já ficou totalmente no passado), usa a data atual (hoje)
-    como vencimento.
-    """
-    candidato_d_mais_2 = ajustar_para_dia_util(hoje.normalize() + pd.Timedelta(days=2), feriados)
-
-    data_pagamento = candidato_d_mais_2
-
-    if (candidato_d_mais_2.year, candidato_d_mais_2.month) == (dt_entrada.year, dt_entrada.month):
-        data_vencimento = candidato_d_mais_2
-    else:
-        venc_dentro_mes_entrada = ultimo_dia_util_do_mes(dt_entrada.year, dt_entrada.month, feriados)
-        if venc_dentro_mes_entrada.normalize() >= hoje.normalize():
-            data_vencimento = venc_dentro_mes_entrada
-        else:
-            # Mês da entrada já passou inteiramente - usa a data atual como fallback.
-            data_vencimento = hoje.normalize()
-
-    return data_pagamento, data_vencimento
-
-
-def descartar_alerta_nativo_se_existir(driver):
-    """Fecha um alert() nativo do navegador, se houver um aberto no momento.
-
-    O portal da SEFAZ-RJ ocasionalmente dispara um alert() nativo (ex.:
-    "Invalid reply from server") quando uma chamada AJAX dele falha no
-    lado do servidor deles - um problema transitório do site, não do
-    nosso código. Enquanto esse alert está aberto, qualquer interação do
-    Selenium com a página (find_element, screenshot, etc.) lança
-    UnexpectedAlertPresentException, então é importante conseguir
-    descartá-lo para seguir com o diagnóstico ou uma nova tentativa.
-    Retorna o texto do alerta (ou None se não havia nenhum aberto).
-    """
-    try:
-        alerta = driver.switch_to.alert
-        texto = alerta.text
-        alerta.accept()
-        return texto
+        texto = driver.switch_to.alert.text
     except NoAlertPresentException:
-        return None
-
-
-def dump_debug(driver, tag):
-    """Salva screenshot + HTML da página no momento da falha, para diagnóstico.
-
-    Além de salvar os arquivos (que viram artefato do GitHub Actions - difícil
-    de baixar de alguns ambientes), imprime no próprio log de texto do Actions
-    diagnósticos essenciais: URL atual, título da página e um trecho do HTML,
-    checando também sinais comuns de bloqueio/geobloqueio/WAF que sites
-    gov.br costumam aplicar contra IPs de datacenter (como os runners do
-    GitHub Actions, que não são IPs brasileiros).
-    """
-    texto_alerta = descartar_alerta_nativo_se_existir(driver)
-    if texto_alerta is not None:
-        print(f"   -> Havia um alert() nativo aberto (descartado para prosseguir): {texto_alerta!r}")
-
-    try:
-        driver.save_screenshot(f"debug_{tag}.png")
-    except Exception as e:
-        print(f"   -> Não foi possível salvar o screenshot: {e}")
-    try:
-        html_atual = driver.page_source
-        with open(f"debug_{tag}.html", "w", encoding="utf-8") as f:
-            f.write(html_atual)
-    except Exception as e:
-        html_atual = ""
-        print(f"   -> Não foi possível salvar o HTML: {e}")
-
-    print(f"   -> Screenshot e HTML salvos como debug_{tag}.png / debug_{tag}.html")
-
-    try:
-        print(f"   -> URL atual: {driver.current_url}")
-        print(f"   -> Título da página: {driver.title!r}")
-        print(f"   -> Nº de janelas/abas abertas: {len(driver.window_handles)}")
-    except Exception as e:
-        print(f"   -> Não foi possível ler URL/título/janelas: {e}")
-
-    # Texto VISÍVEL da página (innerText) - muito mais fácil de ler do que o
-    # HTML cru para notar se um modal/diálogo de confirmação está na tela
-    # (ex.: "Deseja confirmar o item?", "Tem certeza?") que o seletor atual
-    # não reconhece.
-    try:
-        texto_visivel = driver.execute_script("return document.body.innerText;") or ""
-        texto_visivel_limpo = re.sub(r'\n{2,}', '\n', texto_visivel).strip()[:3000]
-        print(f"   -> Texto VISÍVEL da página (innerText, primeiros 3000 caracteres):\n{texto_visivel_limpo}")
-    except Exception as e:
-        print(f"   -> Não foi possível ler o innerText da página: {e}")
-
-    if html_atual:
-        texto_html_lower = html_atual.lower()
-        sinais_bloqueio = [
-            "access denied", "acesso negado", "forbidden", "blocked",
-            "captcha", "recaptcha", "cloudflare", "incapsula", "imperva",
-            "akamai", "bot detection", "unusual traffic", "bloqueado",
-            "não autorizado", "security check", "waf",
-        ]
-        encontrados = [s for s in sinais_bloqueio if s in texto_html_lower]
-        if encontrados:
-            print(f"   -> ATENÇÃO: possíveis sinais de bloqueio/WAF/geobloqueio no HTML: {encontrados}")
-
-        sinais_dialogo = [
-            "confirma", "tem certeza", "deseja", "atenção", "modal", "dialog",
-            "aguarde", "processando", "carregando",
-        ]
-        encontrados_dialogo = [s for s in sinais_dialogo if s in texto_html_lower]
-        if encontrados_dialogo:
-            print(f"   -> Possíveis indícios de modal/diálogo/carregamento no HTML: {encontrados_dialogo}")
-
-        trecho = re.sub(r'\s+', ' ', html_atual).strip()[:4000]
-        print(f"   -> Trecho do HTML (primeiros 4000 caracteres, espaços colapsados): {trecho}")
-
-
-def enviar_pdf_para_drive(caminho_arquivo, folder_id, credenciais):
-    """Realiza o upload do PDF gerado para a pasta do Google Drive."""
-    try:
-        drive_service = build('drive', 'v3', credentials=credenciais)
-        file_metadata = {
-            'name': os.path.basename(caminho_arquivo),
-            'parents': [folder_id]
-        }
-        media = MediaFileUpload(caminho_arquivo, mimetype='application/pdf')
-        arquivo_criado = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id',
-            supportsAllDrives=True,
-            supportsTeamDrives=True
-        ).execute()
-        print(f"PDF enviado com sucesso para o Google Drive! ID: {arquivo_criado.get('id')}")
-        return True
-    except Exception as e:
-        print(f"Erro ao enviar o PDF para o Google Drive: {e}")
-        return False
-
-
-def fechar_modal_informacao_se_existir(driver, timeout=2):
-    """Fecha o modal customizado 'Informação' (não é um alert nativo do browser)."""
-    try:
-        btn_ok = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.XPATH, "//div[contains(@class,'dialog') or contains(.,'Informação')]//button[normalize-space(.)='Ok']"))
-        )
-        btn_ok.click()
-        time.sleep(0.3)
-    except Exception:
         pass
-
-
-# ==============================================================================
-# CONSTANTES FIXAS
-# ==============================================================================
-
-ID_PLANILHA = "1U0HgRTfVIoGo3Jrr9-62ItBZumgJP77QH4SGa_lZ9jI"
-ID_PASTA_DRIVE = "1UApSGUMncRgU15q7UH1MGT6EKrEskYim"
-CNPJ_RESPONSAVEL = "58248352001201"
-PRODUTO_TEXTO = "Peças, Partes e Acessórios para Veículos Automotores"
-NATUREZA_TEXTO = "Substituição Tributária por Operação / Outros"
-
-# ==============================================================================
-# FASE 1: LEITURA E VALIDAÇÃO DE DADOS DA PLANILHA GOOGLE
-# ==============================================================================
-
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credenciais.json", scope)
-client = gspread.authorize(creds)
-
-planilha = client.open_by_key(ID_PLANILHA).sheet1
-
-# Lemos os valores "crus" (em vez de usar get_all_records) por dois motivos:
-# 1) a planilha tem uma linha de TÍTULO na linha 1 ("Pagamento Antecipado
-#    pela COBRA" + "Cod. 023-0"/"Cod. 750-1") e os cabeçalhos de coluna de
-#    verdade ("Data entrada", "Nº Nota Fiscal", ...) só aparecem na linha 2;
-# 2) além disso há colunas extras sem cabeçalho (células em branco) à
-#    direita dos dados reais - o gspread trava com "header row contains
-#    duplicates: ['']" quando há mais de uma coluna com cabeçalho vazio.
-_todos_valores = planilha.get_all_values(value_render_option='FORMATTED_VALUE')
-_LINHA_CABECALHO = 2  # cabeçalhos reais das colunas ficam na linha 2 da planilha
-_cabecalhos_brutos = _todos_valores[_LINHA_CABECALHO - 1] if len(_todos_valores) >= _LINHA_CABECALHO else []
-
-# Deduplica/preenche cabeçalhos vazios ou repetidos para podermos montar os
-# registros como dicionários sem conflito de chave.
-_cabecalhos_unicos = []
-_vistos = {}
-for _idx, _h in enumerate(_cabecalhos_brutos):
-    _h = str(_h).strip()
-    if _h == '':
-        _h = f'_coluna_vazia_{_idx + 1}'
-    if _h in _vistos:
-        _vistos[_h] += 1
-        _h = f'{_h}_{_vistos[_h]}'
     else:
-        _vistos[_h] = 0
-    _cabecalhos_unicos.append(_h)
-
-registros = []
-for _linha in _todos_valores[_LINHA_CABECALHO:]:
-    # ignora linhas totalmente em branco
-    if not any(str(v).strip() for v in _linha):
-        continue
-    _linha_completa = _linha + [''] * (len(_cabecalhos_unicos) - len(_linha))
-    registros.append(dict(zip(_cabecalhos_unicos, _linha_completa)))
-
-hoje = pd.Timestamp.today()
-d_menos_1 = hoje - pd.offsets.BDay(1)
-
-linha_alvo_index = None
-dados_alvo = None
-dt_entrada_alvo = None
-
-for i, registro in enumerate(registros):
-    data_entrada_raw = registro.get('Data entrada')
-    if not data_entrada_raw:
-        continue
-    try:
-        dt_entrada = parse_data_entrada(data_entrada_raw)
-    except Exception:
-        continue
-    if dt_entrada.date() == d_menos_1.date() and str(registro.get('PROC DARJ', '')).strip() == '':
-        linha_alvo_index = i + _LINHA_CABECALHO + 1
-        dados_alvo = registro
-        dt_entrada_alvo = dt_entrada
-        break
-
-if not dados_alvo:
-    print(f"Nenhum registro pendente para a data {d_menos_1.strftime('%d.%m.%Y')}. Encerrando.")
-    exit()
-
-print(f"Registro encontrado na linha {linha_alvo_index}. Nota Fiscal: {dados_alvo.get('Nº Nota Fiscal')}")
-
-cabecalhos = [str(v).strip() for v in planilha.row_values(_LINHA_CABECALHO)]
+        raise RuntimeError(f'Alerta do portal, sem aceitar automaticamente: {texto}')
+    for elemento in driver.find_elements(By.CSS_SELECTOR, '#dialog-message, .ui-dialog-content'):
+        if elemento.is_displayed() and elemento.text.strip():
+            raise RuntimeError(f'Mensagem do portal: {elemento.text.strip()}')
 
 
-def encontrar_coluna(termos_possiveis, nome_padrao):
-    for termo in termos_possiveis:
-        for idx, col_head in enumerate(cabecalhos):
-            if termo.strip().upper() == col_head.strip().upper():
-                return idx + 1
-    raise Exception(f"Coluna '{nome_padrao}' não encontrada. Cabeçalhos disponíveis: {cabecalhos}")
+def esperar(driver, wait, condicao):
+    def consultar(d):
+        try:
+            verificar_mensagens(d)
+            return condicao(d)
+        except (NoSuchElementException, StaleElementReferenceException):
+            return False
+    return wait.until(consultar)
 
 
-col_proc_darj = encontrar_coluna(['PROC DARJ'], 'PROC DARJ')
-planilha.update_cell(linha_alvo_index, col_proc_darj, 'X')
-print("Linha marcada com 'X' em PROC DARJ. Iniciando o processamento...")
-
-# BLINDAGEM: valores de ICMS e FECP vindos da planilha
-nota_fiscal_raw = str(dados_alvo.get('Nº Nota Fiscal', ''))
-nota_fiscal = nota_fiscal_raw.split('-')[0].strip()
-
-darj_normal_float = extrair_float_limpo(dados_alvo.get('DARJ Normal'))
-fecp_float = extrair_float_limpo(dados_alvo.get('FECP'))
-total_guia_float = extrair_float_limpo(dados_alvo.get('TOTAL DA GUIA DE ICMS ST'))
-
-if darj_normal_float <= 0 and fecp_float <= 0:
-    raise ValueError("❌ ERRO CRÍTICO: DARJ Normal e FECP vieram zerados/ inválidos. Abortando!")
-
-# Cross-check: soma deve bater com o total da guia (com tolerância de 1 centavo)
-soma_calculada = round(darj_normal_float + fecp_float, 2)
-if total_guia_float > 0 and abs(soma_calculada - total_guia_float) > 0.01:
-    raise ValueError(
-        f"❌ ERRO CRÍTICO: DARJ Normal ({darj_normal_float:.2f}) + FECP ({fecp_float:.2f}) = "
-        f"{soma_calculada:.2f}, que não bate com TOTAL DA GUIA DE ICMS ST ({total_guia_float:.2f}). "
-        f"Operação abortada por segurança!"
-    )
-
-icms_informado_str = formatar_valor_virgula(darj_normal_float)
-fecp_informado_str = formatar_valor_virgula(fecp_float)
-
-periodo_referencia_str = dt_entrada_alvo.strftime('%m/%Y')
-
-anos_feriados = sorted({hoje.year, dt_entrada_alvo.year, hoje.year + 1})
-feriados_rj = holidays.Brazil(subdiv='RJ', years=anos_feriados)
-
-dt_pagamento, dt_vencimento = calcular_datas_pagamento_vencimento(dt_entrada_alvo, hoje, feriados_rj)
-dt_pagamento_str = dt_pagamento.strftime('%d/%m/%Y')
-dt_vencimento_str = dt_vencimento.strftime('%d/%m/%Y')
-
-print(f"-> Nota Fiscal: {nota_fiscal}")
-print(f"-> ICMS Informado (DARJ Normal): R$ {icms_informado_str}")
-print(f"-> FECP Informado: R$ {fecp_informado_str}")
-print(f"-> Período de Referência: {periodo_referencia_str}")
-print(f"-> Data de Pagamento calculada (D+2 dia útil): {dt_pagamento_str}")
-print(f"-> Data de Vencimento calculada: {dt_vencimento_str}")
-
-# ==============================================================================
-# FASE 2: CONFIGURAÇÃO DO NAVEGADOR
-# ==============================================================================
-
-diretorio_download = os.path.abspath("downloads_darj")
-if not os.path.exists(diretorio_download):
-    os.makedirs(diretorio_download)
-
-# Roda headless automaticamente dentro do GitHub Actions (ou se HEADLESS=true
-# for setado manualmente), e com tela visível em execução local normal.
-RODANDO_HEADLESS = os.getenv("HEADLESS", "").lower() == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+def esperar_elemento(driver, wait, campo_id):
+    return esperar(driver, wait, EC.element_to_be_clickable((By.ID, campo_id)))
 
 
-def criar_driver_chrome():
-    """Cria (ou recria, numa nova tentativa) uma instância nova do Chrome já
-    configurada (anti-detecção de automação, downloads habilitados em modo
-    headless, etc.)."""
+def preencher(driver, wait, campo_id, texto):
+    campo = esperar_elemento(driver, wait, campo_id)
+    if campo.get_property('readOnly'):
+        raise RuntimeError(f'Campo {campo_id} permanece somente leitura')
+    campo.clear()
+    campo.send_keys(texto)
+    # Dispara change/blur sem focar o vencimento readonly: TAB nesse campo
+    # provoca outro onblur que pode calcular valores enquanto a data é limpa.
+    driver.execute_script('arguments[0].blur();', campo)
+    aguardar_ajax(driver, wait)
+
+
+def aguardar_ajax(driver, wait):
+    return esperar(driver, wait, lambda d: d.execute_script("""
+        const engine = window.dwr && dwr.engine ? dwr.engine : window.DWREngine;
+        const pendentes = engine && engine._batches
+          ? Object.values(engine._batches).filter(Boolean).length : 0;
+        return document.readyState === 'complete'
+          && (!window.jQuery || jQuery.active === 0)
+          && pendentes === 0;
+    """))
+
+
+def confirmar_data_pagamento(driver, wait, data):
+    botao = driver.find_element(By.ID, 'btnAlterarDataPagamento')
+    if botao.get_attribute('value').strip() == 'Alterar':
+        botao.click()
+    esperar(driver, wait, lambda d: not d.find_element(By.ID, 'txtDataPagamento').get_property('readOnly'))
+    preencher(driver, wait, 'txtDataPagamento', data)
+    botao = driver.find_element(By.ID, 'btnAlterarDataPagamento')
+    if botao.get_attribute('value').strip() != 'Confirmar!':
+        raise RuntimeError('Portal nao ofereceu a confirmacao da Data de Pagamento')
+    botao.click()
+    esperar(driver, wait, lambda d: (
+        d.find_element(By.ID, 'txtDataPagamento').get_property('readOnly')
+        and d.find_element(By.ID, 'txtDataPagamento').get_attribute('value').strip() == data
+        and d.find_element(By.ID, 'btnAlterarDataPagamento').get_attribute('value').strip() == 'Alterar'
+    ))
+
+
+def selecionar(driver, wait, campo_id, valor):
+    def pronto(d):
+        campo = d.find_element(By.ID, campo_id)
+        return (campo.is_displayed() and campo.is_enabled()
+                and any(o.get_attribute('value') == valor for o in Select(campo).options))
+    esperar(driver, wait, pronto)
+    Select(driver.find_element(By.ID, campo_id)).select_by_value(valor)
+    aguardar_ajax(driver, wait)
+
+
+def criar_driver(diretorio):
     opcoes = Options()
-    opcoes.add_argument("--disable-blink-features=AutomationControlled")
-    opcoes.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opcoes.add_experimental_option('useAutomationExtension', False)
-    opcoes.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    if os.getenv('HEADLESS', '').lower() == 'true' or os.getenv('GITHUB_ACTIONS') == 'true':
+        opcoes.add_argument('--headless=new')
+        opcoes.add_argument('--no-sandbox')
+        opcoes.add_argument('--disable-dev-shm-usage')
+    opcoes.add_argument('--window-size=1920,1080')
+    opcoes.set_capability('unhandledPromptBehavior', 'ignore')
+    opcoes.add_experimental_option('prefs', {
+        'download.default_directory': str(diretorio),
+        'download.prompt_for_download': False,
+        'download.directory_upgrade': True,
+        'plugins.always_open_pdf_externally': True,
+    })
+    # Usa o Chrome instalado pelo workflow quando houver caminho explícito.
+    if os.getenv('CHROME_BINARY'):
+        opcoes.binary_location = os.environ['CHROME_BINARY']
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opcoes)
+    driver.set_page_load_timeout(60)
+    driver.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': str(diretorio)})
+    return driver, WebDriverWait(driver, 45, poll_frequency=0.5)
 
-    if RODANDO_HEADLESS:
-        print("   (Executando em modo headless - sem interface gráfica, como no GitHub Actions)")
-        opcoes.add_argument("--headless=new")
-        opcoes.add_argument("--no-sandbox")
-        opcoes.add_argument("--disable-dev-shm-usage")
-        opcoes.add_argument("--window-size=1920,1080")
+
+def dump_debug(driver, linha, etapa):
+    pasta = BASE / 'diagnosticos' / f'linha_{linha}_{etapa}_{uuid.uuid4().hex[:8]}'
+    pasta.mkdir(parents=True, exist_ok=True)
+    dados = {'linha': linha, 'etapa': etapa, 'hora': datetime.now(ZoneInfo('America/Sao_Paulo')).isoformat(), 'abas': [], 'falhas': []}
+    if driver is None:
+        dados['falhas'].append('Navegador nao inicializado')
     else:
-        opcoes.add_argument("--start-maximized")
-
-    prefs = {
-        "download.default_directory": diretorio_download,
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "plugins.always_open_pdf_externally": True
-    }
-    opcoes.add_experimental_option("prefs", prefs)
-
-    servico = Service(ChromeDriverManager().install())
-    driver_novo = webdriver.Chrome(service=servico, options=opcoes)
-
-    driver_novo.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-        'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    })
-
-    # Necessário para habilitar downloads em modo --headless=new (bloqueados por padrão).
-    driver_novo.execute_cdp_cmd("Page.setDownloadBehavior", {
-        "behavior": "allow",
-        "downloadPath": diretorio_download
-    })
-
-    wait_novo = WebDriverWait(driver_novo, 30)
-    return driver_novo, wait_novo
-
-
-def preencher_formulario_ate_auditoria(driver, wait):
-    """Passos 1 a 10 do formulário + auditoria de segurança (BLINDAGEM),
-    tudo ANTES de confirmar o item na SEFAZ-RJ. Nenhuma ação irreversível
-    acontece aqui (nada de 'Confirmar item' / 'Gerar DARJ'), então é seguro
-    chamar de novo (com um navegador novo) se o portal falhar de forma
-    transitória - já vimos isso acontecer em pontos diferentes do
-    formulário em testes reais (timeout no CNPJ com alert nativo de
-    servidor, timeout ao selecionar o Produto, etc.)."""
-    print("1. Acessando o Portal de Pagamentos da SEFAZ-RJ...")
-    driver.get("https://www1.fazenda.rj.gov.br/portaldepagamentos/")
-    print(f"   -> Página carregada. URL atual: {driver.current_url} | Título: {driver.title!r}")
-
-    print("2. Selecionando Tipo de Pagamento = ICMS/FECP...")
-    select_tipo_pagamento = Select(wait.until(EC.element_to_be_clickable((By.ID, "tipoPagamentoLista"))))
-    select_tipo_pagamento.select_by_value("1")
-    time.sleep(1)
-
-    # Tipo de Documento = DARJ já vem selecionado por padrão, mas garantimos:
-    radio_darj = wait.until(EC.element_to_be_clickable((By.ID, "rdgDarj")))
-    if not radio_darj.is_selected():
-        radio_darj.click()
-
-    print(f"2.1. Ajustando Data de Pagamento para {dt_pagamento_str} (D+2 dia útil)...")
-    driver.find_element(By.ID, "btnAlterarDataPagamento").click()
-    fechar_modal_informacao_se_existir(driver)
-    campo_data_pagamento = wait.until(EC.element_to_be_clickable((By.ID, "txtDataPagamento")))
-    campo_data_pagamento.clear()
-    campo_data_pagamento.send_keys(dt_pagamento_str)
-    time.sleep(0.3)
-
-    # O campo Produto é populado via AJAX disparado pela seleção de Natureza -
-    # em pelo menos dois testes reais essa chamada não completou a tempo e o
-    # combobox nunca ficou clicável (TimeoutException), sem relação aparente
-    # com nenhum defeito de código. Por isso repetimos as duas seleções (não
-    # só a de Produto) algumas vezes antes de desistir, já que selecionar a
-    # Natureza de novo é o que redispara a chamada AJAX que popula o Produto.
-    ultimo_erro_produto = None
-    for tentativa_produto in range(1, 4):
+        original = None
         try:
-            print("3. Selecionando Natureza = 'Substituição Tributária por Operação / Outros'...")
-            select_natureza = Select(wait.until(EC.element_to_be_clickable((By.ID, "slcNaturezaLista"))))
-            select_natureza.select_by_visible_text(NATUREZA_TEXTO)
-            time.sleep(1)
-
-            print("4. Selecionando Produto...")
-            select_produto = Select(wait.until(EC.element_to_be_clickable((By.ID, "slcListaProduto"))))
-            select_produto.select_by_visible_text(PRODUTO_TEXTO)
-            time.sleep(0.5)
-            ultimo_erro_produto = None
-            break
-        except (TimeoutException, UnexpectedAlertPresentException) as e:
-            ultimo_erro_produto = e
-            texto_alerta = descartar_alerta_nativo_se_existir(driver)
-            print(
-                f"   -> Tentativa {tentativa_produto} de selecionar Natureza/Produto falhou "
-                f"({type(e).__name__}: {e}); alert() nativo encontrado: {texto_alerta!r}. "
-                f"{'Tentando novamente...' if tentativa_produto < 3 else 'Sem mais tentativas.'}"
-            )
-            time.sleep(2)
-
-    if ultimo_erro_produto is not None:
-        dump_debug(driver, "erro_selecao_produto")
-        raise Exception(
-            f"❌ ERRO CRÍTICO: Não foi possível selecionar o Produto após 3 tentativas. "
-            f"Último erro: {type(ultimo_erro_produto).__name__}: {ultimo_erro_produto}"
-        )
-
-    print("5. Preenchendo CNPJ e confirmando dados cadastrais...")
-    # Essa consulta já falhou de duas formas transitórias diferentes em
-    # testes reais: um alert() nativo de servidor ("Invalid reply from
-    # server"), e uma mensagem de bloqueio por reputação de IP injetada
-    # dentro da própria página (sem alert nenhum, só TimeoutException porque
-    # os campos de retorno nunca foram preenchidos). As duas vezes a mesma
-    # consulta funcionou normalmente minutos antes/depois, então repetimos
-    # (preenchendo o CNPJ do zero) até 3 vezes antes de desistir.
-    insc_estadual_lida = ""
-    razao_social_lida = ""
-    ultimo_erro_lookup = None
-    for tentativa_cnpj in range(1, 4):
-        try:
-            campo_cnpj = wait.until(EC.element_to_be_clickable((By.ID, "txtCnpjCpf")))
-            campo_cnpj.clear()
-            campo_cnpj.send_keys(CNPJ_RESPONSAVEL)
-            driver.find_element(By.ID, "btnConfirmar").click()
-
-            # Auditoria: confirma que o lookup por CNPJ realmente trouxe Inscrição Estadual/Razão Social
-            wait.until(lambda d: d.find_element(By.ID, "txtInscEstadual").get_attribute("value").strip() != "")
-            insc_estadual_lida = driver.find_element(By.ID, "txtInscEstadual").get_attribute("value").strip()
-            razao_social_lida = driver.find_element(By.ID, "txtNomeRazaoSocial").get_attribute("value").strip()
-            break
-        except (TimeoutException, UnexpectedAlertPresentException, AttributeError) as e:
-            ultimo_erro_lookup = e
-            texto_alerta = descartar_alerta_nativo_se_existir(driver)
-            print(
-                f"   -> Tentativa {tentativa_cnpj} da consulta de CNPJ falhou "
-                f"({type(e).__name__}: {e}); alert() nativo encontrado: {texto_alerta!r}. "
-                f"{'Tentando novamente...' if tentativa_cnpj < 3 else 'Sem mais tentativas.'}"
-            )
-            time.sleep(2)
-
-    print(f"   -> Inscrição Estadual-RJ: {insc_estadual_lida} | Razão Social: {razao_social_lida}")
-
-    if not insc_estadual_lida or not razao_social_lida:
-        dump_debug(driver, "erro_lookup_cnpj")
-        detalhe = f" Último erro: {type(ultimo_erro_lookup).__name__}: {ultimo_erro_lookup}" if ultimo_erro_lookup else ""
-        raise Exception(f"❌ ERRO CRÍTICO: O CNPJ não retornou Inscrição Estadual/Razão Social. Abortando!{detalhe}")
-
-    print("6. Preenchendo Período de Referência...")
-    campo_periodo = wait.until(EC.element_to_be_clickable((By.ID, "txtPeriodo")))
-    campo_periodo.clear()
-    campo_periodo.send_keys(periodo_referencia_str)
-    time.sleep(0.3)
-
-    print("7. Habilitando e preenchendo Data de Vencimento...")
-    driver.find_element(By.ID, "btnAlterarData").click()
-    fechar_modal_informacao_se_existir(driver)
-
-    campo_vencimento = wait.until(EC.element_to_be_clickable((By.ID, "txtDataVencimento")))
-    campo_vencimento.clear()
-    campo_vencimento.send_keys(dt_vencimento_str)
-    time.sleep(0.3)
-
-    print("8. Preenchendo Informações Complementares...")
-    campo_info = driver.find_element(By.ID, "txtJustificativa")
-    campo_info.clear()
-    campo_info.send_keys(f"NF {nota_fiscal_raw}")
-
-    # IMPORTANTE: preenchemos os DOIS campos (ICMS e FECP) antes de clicar em
-    # qualquer botão "OK". O cálculo do portal roda via uma única chamada
-    # AJAX (pfEmitirDocumento.calcularValorICMS) que lê o valor atual de
-    # AMBOS os campos no momento do clique - se clicarmos em "okIcms" com o
-    # campo FECP ainda vazio, o portal calcula o total de FECP como 0,00
-    # (foi exatamente isso que aconteceu num teste real: ICMS bateu, FECP
-    # veio zerado). Preencher os dois primeiro evita essa divergência.
-    print("9. Preenchendo ICMS Informado...")
-    campo_icms = wait.until(EC.element_to_be_clickable((By.ID, "txtIcmsInformado")))
-    campo_icms.clear()
-    campo_icms.send_keys(icms_informado_str)
-
-    print("10. Preenchendo FECP Informado...")
-    campo_fecp = wait.until(EC.element_to_be_clickable((By.ID, "txtFecpInformado")))
-    campo_fecp.clear()
-    campo_fecp.send_keys(fecp_informado_str)
-
-    print("10.1. Confirmando os valores (ICMS e FECP) para o portal calcular os totais...")
-    driver.find_element(By.ID, "okIcms").click()
-    time.sleep(0.5)
-    driver.find_element(By.ID, "okFecp").click()
-
-    wait.until(lambda d: d.find_element(By.ID, "txtTotalIcms").get_attribute("value").strip() != "")
-    wait.until(lambda d: d.find_element(By.ID, "txtTotalFecp").get_attribute("value").strip() != "")
-
-    # Espera os campos ESTABILIZAREM (não só ficarem não-vazios) antes de ler
-    # os totais - veja o comentário de aguardar_valor_estavel() para o porquê.
-    valor_total_icms_raw = aguardar_valor_estavel(driver, "txtTotalIcms")
-    valor_total_fecp_raw = aguardar_valor_estavel(driver, "txtTotalFecp")
-
-    # ==========================================================================
-    # BLINDAGEM: AUDITORIA PÓS-PREENCHIMENTO
-    # ==========================================================================
-    total_icms_dom = extrair_float_limpo(valor_total_icms_raw)
-    total_fecp_dom = extrair_float_limpo(valor_total_fecp_raw)
-
-    print(f"   -> (debug) valor bruto txtIcmsInformado no campo: {driver.find_element(By.ID, 'txtIcmsInformado').get_attribute('value')!r}")
-    print(f"   -> (debug) valor bruto txtFecpInformado no campo: {driver.find_element(By.ID, 'txtFecpInformado').get_attribute('value')!r}")
-    print(f"   -> (debug) valor bruto txtTotalIcms no campo (estabilizado): {valor_total_icms_raw!r}")
-    print(f"   -> (debug) valor bruto txtTotalFecp no campo (estabilizado): {valor_total_fecp_raw!r}")
-
-    print("🔒 AUDITORIA DE SEGURANÇA PRÉ-CONFIRMAÇÃO:")
-    print(f"   -> ICMS (DARJ Normal) planilha: R$ {darj_normal_float:.2f} | Total ICMS no portal: R$ {total_icms_dom:.2f}")
-    print(f"   -> FECP planilha: R$ {fecp_float:.2f} | Total FECP no portal: R$ {total_fecp_dom:.2f}")
-
-    if abs(total_icms_dom - darj_normal_float) > 0.01 or abs(total_fecp_dom - fecp_float) > 0.01:
-        dump_debug(driver, "erro_divergencia_valor")
-        raise ValueError(
-            "❌ BLOQUEIO CRÍTICO DE SEGURANÇA: Os valores calculados pelo portal não conferem com a planilha! "
-            "A emissão da guia foi INTERROMPIDA para evitar prejuízos financeiros!"
-        )
-
-    print("✅ VALIDAÇÃO DE SEGURANÇA CONCLUÍDA: Valores aprovados!")
-
-
-def confirmar_item_e_aguardar_resumo(driver, wait):
-    """Clica em 'Confirmar item' e espera a tela de Resumo de pagamento.
-
-    Esse clique dispara a função JS validarTipoPagamento() -> listarIEAtivas(),
-    que faz uma chamada AJAX/DWR ao backend para incluir o item; só DEPOIS
-    dessa inclusão ser confirmada pelo servidor (há até uma flag oculta
-    "exibirResumo" controlando isso) é que a tela de Resumo aparece. Ou
-    seja: se essa chamada falhar (já confirmamos, inclusive buscando um .js
-    estático do próprio portal de uma infraestrutura totalmente diferente,
-    que o WAF de reputação de IP do SEFAZ-RJ pode bloquear silenciosamente
-    chamadas como essa, sem mostrar erro nenhum na tela - o item nunca foi
-    incluído no servidor e nenhum documento foi gerado. Por isso essa etapa
-    é segura para entrar no mesmo retry-com-navegador-novo do preenchimento:
-    o ponto de não retorno real é só o clique em 'Gerar DARJ' (que de fato
-    gera o documento), não este aqui.
-    """
-    print("11. Clicando em 'Confirmar item'...")
-    btn_confirmar_item = wait.until(EC.element_to_be_clickable((
-        By.XPATH, "//input[@type='button' and contains(@value,'Confirmar item')]"
-    )))
-    btn_confirmar_item.click()
-    time.sleep(1.5)
-    fechar_modal_informacao_se_existir(driver)
-
-    print("12. Aguardando tela de Resumo de pagamento...")
-    wait.until(EC.presence_of_element_located((
-        By.XPATH, "//*[contains(text(),'Resumo de pagamento') or contains(text(),'Gerar DARJ')]"
-    )))
-
-    # Marca a checkbox do item, se existir
-    try:
-        checkboxes = driver.find_elements(By.XPATH, "//table//input[@type='checkbox']")
-        for cb in checkboxes:
-            if not cb.is_selected():
-                driver.execute_script("arguments[0].click();", cb)
-    except Exception:
-        pass
-
-    dump_debug(driver, "resumo_pagamento_pre_geracao")  # registro para auditoria, sempre salvo
-
-
-# ==============================================================================
-# FASE 3: NAVEGAÇÃO, PREENCHIMENTO E CONFIRMAÇÃO DO ITEM (com retry em falha
-# transitória - tudo aqui é seguro de repetir do zero, pois nenhum documento
-# é gerado até o clique em "Gerar DARJ" na FASE 4 abaixo)
-# ==============================================================================
-
-MAX_TENTATIVAS_PREENCHIMENTO = 5
-driver = None
-wait = None
-erro_preenchimento = None
-
-for tentativa in range(1, MAX_TENTATIVAS_PREENCHIMENTO + 1):
-    if driver is not None:
-        try:
-            driver.quit()
+            dados['alerta'] = driver.switch_to.alert.text
         except Exception:
             pass
-    driver, wait = criar_driver_chrome()
-    try:
-        preencher_formulario_ate_auditoria(driver, wait)
-        confirmar_item_e_aguardar_resumo(driver, wait)
-        erro_preenchimento = None
-        break
-    except Exception as e:
-        erro_preenchimento = e
-        print(f"⚠️ Tentativa {tentativa}/{MAX_TENTATIVAS_PREENCHIMENTO} de preenchimento/confirmação do item falhou: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        dump_debug(driver, f"erro_preenchimento_tentativa_{tentativa}")
-        if tentativa < MAX_TENTATIVAS_PREENCHIMENTO:
-            # Backoff um pouco mais longo entre tentativas completas (não só
-            # entre as sub-tentativas de CNPJ/Produto) - testes reais têm
-            # mostrado o WAF do SEFAZ-RJ bloqueando etapas diferentes em
-            # sequência rápida; dar mais tempo entre reinícios completos do
-            # navegador aumenta a chance de a próxima tentativa não ser
-            # pega pelo mesmo bloqueio transitório.
-            print("   -> Fechando o navegador e tentando tudo de novo do zero (aguardando 10s antes)...")
-            time.sleep(10)
-
-if erro_preenchimento is not None:
-    print(f"Ocorreu um erro na automação: {type(erro_preenchimento).__name__}: {erro_preenchimento}")
-    if driver is not None:
-        driver.quit()
-else:
-    try:
-        # ==========================================================================
-        # FASE 4: GERAÇÃO DO DARJ (ponto de não retorno - tentativa única)
-        # ==========================================================================
-        print("13. Clicando em 'Gerar DARJ'...")
-        btn_gerar_darj = wait.until(EC.element_to_be_clickable((
-            By.XPATH, "//input[@type='button' and contains(@value,'Gerar DARJ')] | //a[contains(.,'Gerar DARJ')]"
-        )))
-        btn_gerar_darj.click()
-        time.sleep(3)
-
-        # ==========================================================================
-        # FASE 5: EXTRAÇÃO DOS DADOS DA GUIA GERADA
-        # ==========================================================================
-        print("14. Extraindo dados da guia DARJ gerada...")
-
-        # Pode abrir em nova aba/janela - trata ambos os casos
-        if len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[-1])
-
-        time.sleep(2)
-
-        dados_darj = driver.execute_script("""
-            var textoPagina = document.body.innerText;
-            var matchNum = textoPagina.match(/N[úu]mero (?:do )?(?:Documento|DARJ):?\\s*([\\w\\-\\.\\/]+)/i);
-            var matchVcto = textoPagina.match(/(?:Vencimento|Validade):?\\s*([\\d\\/]+)/i);
-            var matchValor = textoPagina.match(/Valor(?: Total)?:?\\s*(?:do Documento)?:?\\s*(R\\$)?\\s*([\\d\\.,]+)/i);
-            return {
-                numDarj: matchNum ? matchNum[1].trim() : '',
-                vencimento: matchVcto ? matchVcto[1].trim() : '',
-                valor: matchValor ? matchValor[2].trim() : ''
-            };
-        """)
-
-        link_darj_atual = driver.current_url
-        print(f"Dados extraídos -> Nº DARJ: {dados_darj['numDarj']}, Vencimento: {dados_darj['vencimento']}, Valor: {dados_darj['valor']}")
-
-        if not dados_darj['numDarj']:
-            dump_debug(driver, "extracao_numero_darj_falhou")
-            print("⚠️ Não foi possível localizar automaticamente o Nº do DARJ na página. "
-                  "Verifique debug_extracao_numero_darj_falhou.png/html e ajuste os seletores/regex acima.")
-
-        # Tenta localizar um link/botão de download do PDF do boleto
         try:
-            link_pdf = driver.find_element(
-                By.XPATH,
-                "//a[contains(@href,'.pdf') or contains(@onclick,'pdf') or contains(.,'Imprimir') or contains(.,'Download')] "
-                "| //img[contains(@src,'barcode') or contains(@alt,'Imprimir')]"
-            )
-            driver.execute_script("arguments[0].click();", link_pdf)
-            time.sleep(4)
-        except Exception:
-            print("⚠️ Não encontrei automaticamente um botão/link de download do PDF. "
-                  "Pode ser necessário desativar bloqueador de pop-up ou ajustar o seletor.")
-            dump_debug(driver, "pdf_nao_encontrado")
+            original = driver.current_window_handle
+            handles = list(driver.window_handles)
+        except Exception as exc:
+            dados['falhas'].append(str(exc))
+            handles = []
+        for i, handle in enumerate(handles):
+            try:
+                driver.switch_to.window(handle)
+                driver.switch_to.default_content()
+            except Exception as exc:
+                dados['falhas'].append(f'aba {i}: {exc}')
+                continue
+            item = {'handle': handle}
+            for campo in ('current_url', 'title'):
+                try:
+                    item[campo] = getattr(driver, campo)
+                except Exception as exc:
+                    item[campo] = str(exc)
+            try:
+                driver.save_screenshot(str(pasta / f'aba_{i}.png'))
+            except Exception as exc:
+                dados['falhas'].append(f'PNG aba {i}: {exc}')
+            try:
+                (pasta / f'aba_{i}.html').write_text(driver.page_source, encoding='utf-8')
+            except Exception as exc:
+                dados['falhas'].append(f'HTML aba {i}: {exc}')
+            try:
+                item['campos'] = driver.execute_script("""
+                    return Array.from(document.querySelectorAll('input,select,textarea'))
+                      .filter(e=>e.type!=='hidden' && (e.offsetWidth||e.offsetHeight))
+                      .map(e=>({id:e.id,value:e.value,readOnly:e.readOnly,disabled:e.disabled}));
+                """)
+            except Exception as exc:
+                dados['falhas'].append(f'campos aba {i}: {exc}')
+            dados['abas'].append(item)
+        if original:
+            try:
+                driver.switch_to.window(original)
+            except Exception:
+                pass
+    (pasta / 'contexto.json').write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f'Diagnostico salvo: {pasta}')
 
-        arquivos_pdf = [os.path.join(diretorio_download, f) for f in os.listdir(diretorio_download) if f.endswith('.pdf')]
-        if arquivos_pdf:
-            pdf_recente = max(arquivos_pdf, key=os.path.getctime)
-            num_darj_limpo = re.sub(r'[^0-9A-Za-z]', '', dados_darj['numDarj']) or 'SEMNUMERO'
-            nome_personalizado = f"DARJ_NF_{nota_fiscal}_{num_darj_limpo}.pdf"
-            caminho_renomeado = os.path.join(diretorio_download, nome_personalizado)
-            if os.path.exists(caminho_renomeado):
-                os.remove(caminho_renomeado)
-            os.rename(pdf_recente, caminho_renomeado)
-            print(f"PDF local salvo e renomeado para: {nome_personalizado}")
 
-            print("14.1. Enviando PDF para a pasta do Google Drive...")
-            enviar_pdf_para_drive(caminho_renomeado, ID_PASTA_DRIVE, creds)
-        else:
-            print("Aviso: Nenhum PDF foi localizado na pasta de downloads.")
+def auditar_formulario(driver, wait, alvo):
+    def confere(d):
+        ids = ('txtIcmsInformado', 'txtFecpInformado', 'txtTotalIcms', 'txtTotalFecp')
+        try:
+            valores = [dinheiro(d.find_element(By.ID, campo).get_attribute('value')) for campo in ids]
+        except ValueError:
+            return False
+        return (valores == [alvo.icms, alvo.fecp, alvo.icms, alvo.fecp]
+                and valores[2] + valores[3] == alvo.total)
+    aguardar_ajax(driver, wait)
+    esperar(driver, wait, confere)
+    if driver.find_element(By.ID, 'btnAlterarDataPagamento').get_attribute('value').strip() != 'Alterar':
+        raise RuntimeError('Data de Pagamento ainda aguarda confirmacao')
+    for campo, esperado in [('txtDataPagamento', alvo.pagamento.strftime('%d/%m/%Y')),
+                            ('txtDataVencimento', alvo.vencimento.strftime('%d/%m/%Y')),
+                            ('txtPeriodo', alvo.periodo)]:
+        if driver.find_element(By.ID, campo).get_attribute('value').strip() != esperado:
+            raise RuntimeError(f'Campo {campo} divergiu do previsto')
+    if driver.find_element(By.ID, 'txtJustificativa').get_attribute('value').strip() != f'NF {alvo.nota_raw}':
+        raise RuntimeError('Nota fiscal nas informacoes complementares divergiu')
+    if (driver.find_element(By.ID, 'slcNaturezaLista').get_attribute('value') != '4'
+            or driver.find_element(By.ID, 'slcListaProduto').get_attribute('value') != '442'):
+        raise RuntimeError('Natureza ou produto mudou durante o preenchimento')
+    print(f'Auditoria aprovada: ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} = {brl(alvo.total)}')
 
-        # ==========================================================================
-        # FASE 6: GRAVAÇÃO DOS RESULTADOS NA PLANILHA
-        # ==========================================================================
-        print("15. Gravando informações na planilha Google...")
 
-        col_num_darj = encontrar_coluna(['Nº DARJ'], 'Nº DARJ')
-        col_vcto_darj = encontrar_coluna(['Vcto DARJ'], 'Vcto DARJ')
-        col_valor_darj = encontrar_coluna(['Valor DARJ'], 'Valor DARJ')
-        col_link_darj = encontrar_coluna(['Link DARJ'], 'Link DARJ')
+def preencher_formulario(driver, wait, alvo):
+    driver.get(URL_PORTAL)
+    selecionar(driver, wait, 'tipoPagamentoLista', '1')
+    radio = esperar_elemento(driver, wait, 'rdgDarj')
+    if not radio.is_selected():
+        radio.click()
+        aguardar_ajax(driver, wait)
+    confirmar_data_pagamento(driver, wait, alvo.pagamento.strftime('%d/%m/%Y'))
+    # Confirmar a data recarrega o formulário; natureza/produto vêm depois.
+    aguardar_ajax(driver, wait)
+    selecionar(driver, wait, 'slcNaturezaLista', '4')
+    selecionar(driver, wait, 'slcListaProduto', '442')
+    preencher(driver, wait, 'txtCnpjCpf', CNPJ_RESPONSAVEL)
+    esperar_elemento(driver, wait, 'btnConfirmar').click()
+    esperar(driver, wait, lambda d: (
+        d.find_element(By.ID, 'txtInscEstadual').get_attribute('value').strip() not in ('', '0')
+        and d.find_element(By.ID, 'txtNomeRazaoSocial').get_attribute('value').strip()
+        and d.find_element(By.ID, 'btnConfirmar').get_attribute('value').strip() == 'Alterar'
+    ))
+    if re.sub(r'\D', '', driver.find_element(By.ID, 'txtCnpjCpf').get_attribute('value')) != CNPJ_RESPONSAVEL:
+        raise RuntimeError('CNPJ do formulario divergiu do configurado')
+    selecionar(driver, wait, 'slcTipoPeriodo', 'M')
+    preencher(driver, wait, 'txtPeriodo', alvo.periodo)
+    esperar_elemento(driver, wait, 'btnAlterarData').click()
+    esperar(driver, wait, lambda d: not d.find_element(By.ID, 'txtDataVencimento').get_property('readOnly'))
+    preencher(driver, wait, 'txtDataVencimento', alvo.vencimento.strftime('%d/%m/%Y'))
+    preencher(driver, wait, 'txtJustificativa', f'NF {alvo.nota_raw}')
+    preencher(driver, wait, 'txtIcmsInformado', brl(alvo.icms))
+    preencher(driver, wait, 'txtFecpInformado', brl(alvo.fecp))
+    esperar_elemento(driver, wait, 'okIcms').click()
+    aguardar_ajax(driver, wait)
+    esperar_elemento(driver, wait, 'okFecp').click()
+    auditar_formulario(driver, wait, alvo)
 
-        planilha.update_cell(linha_alvo_index, col_num_darj, dados_darj['numDarj'])
-        planilha.update_cell(linha_alvo_index, col_vcto_darj, dados_darj['vencimento'] or dt_vencimento_str)
-        planilha.update_cell(linha_alvo_index, col_valor_darj, dados_darj['valor'] or f"{darj_normal_float + fecp_float:.2f}".replace('.', ','))
-        planilha.update_cell(linha_alvo_index, col_link_darj, link_darj_atual)
 
-        print("Planilha atualizada com sucesso!")
-        print("Processo concluído!")
+XPATH_GERAR = "//input[@type='button' and contains(@value,'Gerar DARJ')] | //button[normalize-space(.)='Gerar DARJ'] | //a[normalize-space(.)='Gerar DARJ']"
 
-    except Exception as erro:
-        print(f"Ocorreu um erro na automação: {type(erro).__name__}: {erro}")
-        print("   -> Traceback completo:")
-        traceback.print_exc()
-        dump_debug(driver, "erro_execucao")
 
+def botao_gerar_unico(driver):
+    candidatos = [e for e in driver.find_elements(By.XPATH, XPATH_GERAR) if e.is_displayed() and e.is_enabled()]
+    if len(candidatos) > 1:
+        raise RuntimeError('Mais de um botao Gerar DARJ; nenhuma emissao solicitada')
+    return candidatos[0] if candidatos else False
+
+
+def auditar_resumo(driver, wait, alvo):
+    botao = esperar(driver, wait, botao_gerar_unico)
+    quantidade = driver.find_element(By.ID, 'hdnQuantidadeDocs').get_attribute('value').strip()
+    if quantidade != '1':
+        raise RuntimeError(f'Resumo contem {quantidade!r} documentos; esperado somente um por linha')
+    itens = [e for e in driver.find_elements(By.CSS_SELECTOR, 'input[type=checkbox][id^=chkItens]')
+             if e.is_displayed() and e.is_enabled()]
+    if len(itens) > 1:
+        raise RuntimeError('Resumo contem varios itens selecionaveis')
+    if itens and not itens[0].is_selected():
+        itens[0].click()
+    aguardar_ajax(driver, wait)
+    if dinheiro(driver.find_element(By.ID, 'hdnValorTotal').get_attribute('value')) != alvo.total:
+        raise RuntimeError('Valor total do resumo diverge da planilha')
+    return botao
+
+
+def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90):
+    limite = time.monotonic() + timeout
+    anterior = None
+    while time.monotonic() < limite:
+        verificar_mensagens(driver)
+        arquivos = [p for p in diretorio.glob('*.pdf') if p.name not in anteriores]
+        if len(arquivos) > 1:
+            raise RuntimeError('Mais de um PDF novo; conferir sem escolher o mais recente')
+        if arquivos and not list(diretorio.glob('*.crdownload')) and not list(diretorio.glob('*.part')):
+            arquivo = arquivos[0]
+            tamanho = arquivo.stat().st_size
+            if tamanho > 0 and anterior == (arquivo.name, tamanho):
+                return arquivo
+            anterior = (arquivo.name, tamanho)
+        # Algumas respostas são HTML imprimível numa aba nova. Imprimir localmente
+        # não solicita outro DARJ. Exigimos identidade/valor e código de barras.
+        original = driver.current_window_handle
+        for handle in list(driver.window_handles):
+            driver.switch_to.window(handle)
+            try:
+                conteudo = driver.execute_script("""
+                    return {texto:document.body ? document.body.innerText : '',
+                      pronto:document.readyState==='complete' && Array.from(document.images).every(i=>i.complete),
+                      barras:!!document.querySelector('img[src*=barcode i],img[src*=barras i],img[alt*=barras i]')};
+                """)
+                if not conteudo or not conteudo['pronto']:
+                    continue
+                try:
+                    extrair_dados_pdf(conteudo['texto'], alvo, CNPJ_RESPONSAVEL)
+                except ValueError:
+                    continue
+                linha_digitavel = any(44 <= len(re.sub(r'\D', '', linha)) <= 48
+                                      for linha in conteudo['texto'].splitlines()
+                                      if re.fullmatch(r'[\d .-]+', linha.strip()))
+                if not (conteudo['barras'] or linha_digitavel):
+                    continue
+                pdf = driver.execute_cdp_cmd('Page.printToPDF', {'printBackground': True, 'preferCSSPageSize': True})
+                caminho = diretorio / 'darj_renderizado.pdf'
+                caminho.write_bytes(base64.b64decode(pdf['data']))
+                return caminho
+            finally:
+                driver.switch_to.window(original)
+        time.sleep(0.5)
+    raise TimeoutError('PDF novo nao confirmado. Conferir diagnosticos; nao clicar em Gerar DARJ novamente')
+
+
+def emitir_portal(alvo, antes_envio):
+    diretorio = BASE / 'downloads_darj' / f'linha_{alvo.linha}_{uuid.uuid4().hex[:10]}'
+    diretorio.mkdir(parents=True)
+    driver = None
+    try:
+        driver, wait = criar_driver(diretorio)
+        preencher_formulario(driver, wait, alvo)
+        dump_debug(driver, alvo.linha, 'antes_confirmar_item')
+        confirmar = esperar(driver, wait, EC.element_to_be_clickable((
+            By.XPATH, "//input[@type='button' and contains(@value,'Confirmar item')]"
+        )))
+        antes_envio()
+        confirmar.click()  # Tentativa única, inclusive nesta inclusão no resumo.
+        botao = auditar_resumo(driver, wait, alvo)
+        dump_debug(driver, alvo.linha, 'antes_gerar')
+        anteriores = {p.name for p in diretorio.glob('*.pdf')}
+        antes_envio()  # Nova conferência da planilha imediatamente antes de emitir.
+        botao.click()  # Tentativa única de geração.
+        caminho = aguardar_pdf(driver, diretorio, anteriores, alvo)
+        dump_debug(driver, alvo.linha, 'retorno_geracao')
+        return caminho
+    except Exception:
+        try:
+            dump_debug(driver, alvo.linha, 'erro')
+        except Exception as diagnostico:
+            print(f'Falha adicional no diagnostico: {diagnostico}')
+        raise
     finally:
-        driver.quit()
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def selecionar_aba(pasta):
+    candidatas = []
+    for aba in pasta.worksheets():
+        try:
+            resolver_colunas(aba.row_values(LINHA_CABECALHO))
+        except ValueError:
+            continue
+        if aba.title == ABA_CONTROLE:
+            return aba
+        candidatas.append(aba)
+    if len(candidatas) == 1:
+        return candidatas[0]
+    raise RuntimeError(f'Aba {ABA_CONTROLE!r} nao identificada de forma unica pelos cabecalhos')
+
+
+@contextmanager
+def exclusao_local():
+    arquivo = (BASE / '.darj-rj.lock').open('a+b')
+    try:
+        arquivo.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            if arquivo.read(1) == b'':
+                arquivo.write(b'0'); arquivo.flush()
+            arquivo.seek(0)
+            msvcrt.locking(arquivo.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(arquivo.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        arquivo.close()
+        raise RuntimeError('Outro processo DARJ-RJ ja esta executando nesta pasta') from exc
+    try:
+        yield
+    finally:
+        arquivo.close()  # O sistema operacional libera o bloqueio, inclusive em falhas.
+
+
+def main():
+    import holidays
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--validar', action='store_true', help='Somente validar a planilha, sem emitir ou mudar status')
+    args = parser.parse_args()
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    with exclusao_local():
+        credenciais = ServiceAccountCredentials.from_json_keyfile_name(str(BASE / 'credenciais.json'), scope)
+        planilha = selecionar_aba(gspread.authorize(credenciais).open_by_key(ID_PLANILHA))
+        valores = planilha.get_all_values(value_render_option='FORMATTED_VALUE')
+        hoje = datetime.now(ZoneInfo('America/Sao_Paulo')).date()
+        anos = {hoje.year - 1, hoje.year, hoje.year + 1}
+        feriados = holidays.Brazil(subdiv='RJ', years=sorted(anos))
+        drive = build('drive', 'v3', credentials=credenciais)
+
+        def subir_pdf(caminho):
+            arquivo = drive.files().create(
+                body={'name': caminho.name, 'parents': [ID_PASTA_DRIVE]},
+                media_body=MediaFileUpload(str(caminho), mimetype='application/pdf'),
+                fields='id', supportsAllDrives=True,
+            ).execute()
+            file_id = arquivo.get('id')
+            if not file_id:
+                raise RuntimeError('Upload sem identificador de arquivo no Drive')
+            return file_id
+
+        resultado = executar_lote(valores, planilha, emitir_portal, subir_pdf, hoje, feriados,
+                                   CNPJ_RESPONSAVEL, apenas_validar=args.validar,
+                                   linha_cabecalho=LINHA_CABECALHO)
+        print(f'Lote finalizado: {resultado}')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as erro:
+        print(f'EXECUCAO INTERROMPIDA: {type(erro).__name__}: {erro}', file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)

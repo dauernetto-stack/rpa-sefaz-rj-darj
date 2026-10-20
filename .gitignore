@@ -18,3 +18,15 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+
+credenciais.json
+.darj-rj.lock
+.venv/
+.wdm/
+__pycache__/
+*.pyc
+diagnosticos/
+downloads_darj/
+debug_*.png
+debug_*.html
