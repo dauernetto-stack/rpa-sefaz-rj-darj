@@ -21,7 +21,10 @@ jobs:
     # actions/setup-python aqui - ela não tem build pré-compilado para
     # Debian 12 em runners self-hosted.
     runs-on: self-hosted
-    timeout-minutes: 15
+    # Com 5 tentativas completas (navegador novo a cada uma) + retries
+    # internos de CNPJ/Produto + 10s de espera entre tentativas, o pior
+    # caso ficou mais longo - timeout aumentado de 15 para 25min de folga.
+    timeout-minutes: 25
 
     steps:
       - name: Checkout do repositório

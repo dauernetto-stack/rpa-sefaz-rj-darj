@@ -714,7 +714,7 @@ def confirmar_item_e_aguardar_resumo(driver, wait):
 # é gerado até o clique em "Gerar DARJ" na FASE 4 abaixo)
 # ==============================================================================
 
-MAX_TENTATIVAS_PREENCHIMENTO = 3
+MAX_TENTATIVAS_PREENCHIMENTO = 5
 driver = None
 wait = None
 erro_preenchimento = None
@@ -737,8 +737,14 @@ for tentativa in range(1, MAX_TENTATIVAS_PREENCHIMENTO + 1):
         traceback.print_exc()
         dump_debug(driver, f"erro_preenchimento_tentativa_{tentativa}")
         if tentativa < MAX_TENTATIVAS_PREENCHIMENTO:
-            print("   -> Fechando o navegador e tentando tudo de novo do zero...")
-            time.sleep(3)
+            # Backoff um pouco mais longo entre tentativas completas (não só
+            # entre as sub-tentativas de CNPJ/Produto) - testes reais têm
+            # mostrado o WAF do SEFAZ-RJ bloqueando etapas diferentes em
+            # sequência rápida; dar mais tempo entre reinícios completos do
+            # navegador aumenta a chance de a próxima tentativa não ser
+            # pega pelo mesmo bloqueio transitório.
+            print("   -> Fechando o navegador e tentando tudo de novo do zero (aguardando 10s antes)...")
+            time.sleep(10)
 
 if erro_preenchimento is not None:
     print(f"Ocorreu um erro na automação: {type(erro_preenchimento).__name__}: {erro_preenchimento}")
