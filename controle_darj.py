@@ -1,5 +1,4 @@
 """Controle de lote e validações locais. Importar este módulo não acessa serviços."""
-from calendar import monthrange
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -100,23 +99,18 @@ def calcular_datas(entrada, hoje, feriados):
 
     pagamento = hoje
     dias_contados = 0
-
     while dias_contados < 2:
         pagamento += timedelta(days=1)
         if dia_util(pagamento, feriados):
             dias_contados += 1
 
-    if (pagamento.year, pagamento.month) == (
-        entrada.year, entrada.month
-    ):
+    if (pagamento.year, pagamento.month) == (entrada.year, entrada.month):
         vencimento = pagamento
     else:
         ultimo_dia = monthrange(entrada.year, entrada.month)[1]
         limite = date(entrada.year, entrada.month, ultimo_dia)
-
         while not dia_util(limite, feriados):
             limite -= timedelta(days=1)
-
         vencimento = limite if limite >= hoje else hoje
 
     return pagamento, vencimento
@@ -160,22 +154,57 @@ def extrair_dados_pdf(texto, alvo, cnpj):
     texto = normalizar(texto)
     if 'darj' not in texto:
         raise ValueError('O PDF nao foi identificado como DARJ')
-    cnpjs = {re.sub(r'\D', '', n) for n in re.findall(r'\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b', texto)}
+    cnpjs = {re.sub(r'\D', '', n) for n in re.findall(
+        r'\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b', texto)}
     if cnpj not in cnpjs:
         raise ValueError('CNPJ esperado nao encontrado no PDF')
     if not re.search(r'\bnf\s*[:#]?\s*' + re.escape(alvo.nota_raw) + r'(?![\d-])', texto):
         raise ValueError('Nota fiscal esperada nao encontrada nas informacoes do PDF')
-    numeros = re.findall(r'(?:numero\s+(?:do\s+)?(?:documento|darj)|n[º°o]\s*(?:do\s+)?(?:documento|darj)|nosso\s+numero)\s*:?\s*([0-9][0-9. /-]{5,35})', texto)
-    numeros = {re.sub(r'\D', '', n) for n in numeros}
-    if len(numeros) != 1 or not re.fullmatch(r'\d{6,24}', next(iter(numeros), '')):
-        raise ValueError('Numero do DARJ nao identificado de forma unica no PDF; manter REVISAR')
-    datas = {parse_data(v) for v in re.findall(r'(?:data\s+de\s+)?vencimento\s*:?\s*(\d{2}/\d{2}/\d{4})', texto)}
+
+    linhas = [linha for linha in texto.splitlines() if linha.strip()]
+
+    def ler_campo(rotulo, padrao):
+        valores = []
+        for indice, linha in enumerate(linhas):
+            for campo in re.finditer(rotulo, linha):
+                trecho = linha[campo.end():].strip(' \t:')
+                if not trecho and indice + 1 < len(linhas):
+                    trecho = linhas[indice + 1]
+                encontrados = re.findall(padrao, trecho)
+                if len(encontrados) != 1:
+                    raise ValueError(f'Campo {campo.group()!r} ausente ou ambiguo no PDF; manter REVISAR')
+                valores.append(encontrados[0])
+        return valores
+
+    # Nosso Numero identifica o DARJ. O campo No Documento tem outro significado.
+    if re.search(r'nosso\s+numero', texto):
+        numeros = set(ler_campo(r'nosso\s+numero', r'(?<!\d)\d{25}(?!\d)'))
+    else:
+        numeros = set(ler_campo(
+            r'(?:numero\s+(?:do\s+)?(?:documento|darj)|n[º°o]\s*(?:do\s+)?(?:documento|darj))',
+            r'(?<![\d.,/])\d{6,25}(?![\d.,/])'))
+    if len(numeros) != 1:
+        raise ValueError('Numero do DARJ ausente ou diferente entre as vias/DIP; manter REVISAR')
+
+    padrao_data = r'(?<!\d)\d{2}/\d{2}/\d{4}(?!\d)'
+    datas = {parse_data(v) for v in ler_campo(
+        r'(?:data\s+(?:de\s+)?)?vencimento', padrao_data)}
     if datas != {alvo.vencimento}:
         raise ValueError('Vencimento do PDF ausente, ambiguo ou diferente do previsto')
-    valores = {dinheiro(v) for v in re.findall(r'(?:valor\s+total|total\s+a\s+pagar)\s*:?\s*(?:r\$\s*)?([\d.,]+)', texto)}
+
+    # A validade do DARJ e a data de pagamento podem diferir do vencimento do DIP.
+    pagamentos = {parse_data(v) for v in ler_campo(
+        r'data\s+(?:validade|(?:de\s+)?pagamento)', padrao_data)}
+    if pagamentos and pagamentos != {alvo.pagamento}:
+        raise ValueError('Pagamento/validade do PDF diferente do previsto')
+
+    padrao_valor = r'(?<![\d.,/])(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}(?![\d.,/])'
+    valores = {dinheiro(v) for v in ler_campo(
+        r'(?:valor\s+total|total\s+a\s+pagar)', padrao_valor)}
     if valores != {alvo.total}:
         raise ValueError('Valor total do PDF ausente, ambiguo ou divergente')
-    return {'numero': numeros.pop(), 'vencimento': alvo.vencimento.strftime('%d/%m/%Y'), 'valor': brl(alvo.total)}
+    return {'numero': numeros.pop(), 'vencimento': alvo.vencimento.strftime('%d/%m/%Y'),
+            'valor': brl(alvo.total)}
 
 
 def validar_pdf(caminho, alvo, cnpj):
@@ -187,7 +216,7 @@ def validar_pdf(caminho, alvo, cnpj):
     leitor = PdfReader(caminho, strict=True)
     if leitor.is_encrypted:
         raise ValueError('PDF protegido; conferir manualmente')
-    texto = '\n'.join(p.extract_text() or '' for p in leitor.pages)
+    texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
     dados = extrair_dados_pdf(texto, alvo, cnpj)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
     nome = f"{prefixo}DARJ_NF_{alvo.nota}_{dados['numero']}.pdf"
