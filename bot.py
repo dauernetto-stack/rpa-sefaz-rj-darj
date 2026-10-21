@@ -21,6 +21,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import WebDriverException
 
 from controle_darj import brl, dinheiro, executar_lote, extrair_dados_pdf, resolver_colunas
 
@@ -48,10 +49,26 @@ def verificar_mensagens(driver):
 def esperar(driver, wait, condicao):
     def consultar(d):
         try:
-            verificar_mensagens(d)
+            try:
+                verificar_mensagens(d)
+            except WebDriverException as exc:
+                if (
+                    "Node with given id does not belong to the document"
+                    in str(exc)
+                ):
+                    # A tela mudou durante a leitura.
+                    # Reconsulta sem repetir cliques.
+                    return False
+                raise
+
             return condicao(d)
-        except (NoSuchElementException, StaleElementReferenceException):
+
+        except (
+            NoSuchElementException,
+            StaleElementReferenceException,
+        ):
             return False
+
     return wait.until(consultar)
 
 
