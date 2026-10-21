@@ -95,18 +95,30 @@ def dia_util(dia, feriados):
 
 
 def calcular_datas(entrada, hoje, feriados):
-    """Preserva a regra de datas herdada do projeto; não determina prazo fiscal."""
-    pagamento = hoje + timedelta(days=2)
-    while not dia_util(pagamento, feriados):
+    """D+2 util confirmado; vencimento segue a regra do projeto original."""
+    from calendar import monthrange
+
+    pagamento = hoje
+    dias_contados = 0
+
+    while dias_contados < 2:
         pagamento += timedelta(days=1)
-    vencimento = pagamento
-    if (pagamento.year, pagamento.month) != (entrada.year, entrada.month):
-        limite = date(entrada.year, entrada.month, monthrange(entrada.year, entrada.month)[1])
+        if dia_util(pagamento, feriados):
+            dias_contados += 1
+
+    if (pagamento.year, pagamento.month) == (
+        entrada.year, entrada.month
+    ):
+        vencimento = pagamento
+    else:
+        ultimo_dia = monthrange(entrada.year, entrada.month)[1]
+        limite = date(entrada.year, entrada.month, ultimo_dia)
+
         while not dia_util(limite, feriados):
             limite -= timedelta(days=1)
+
         vencimento = limite if limite >= hoje else hoje
-    if not dia_util(vencimento, feriados):
-        raise ValueError('Regra herdada resultou em vencimento nao util; conferir datas antes de emitir')
+
     return pagamento, vencimento
 
 

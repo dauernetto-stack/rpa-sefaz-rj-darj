@@ -163,9 +163,43 @@ class ControleDARJ(unittest.TestCase):
         self.assertEqual(controle.calcular_datas(date(2026,10,7),date(2026,10,8),{date(2026,10,12)}),
                          (date(2026,10,13),date(2026,10,13)))
 
-    def test_limite_do_mes_preserva_regra_herdada(self):
-        self.assertEqual(controle.calcular_datas(date(2026,10,28),date(2026,10,29),{date(2026,11,2)}),
-                         (date(2026,11,3),date(2026,10,30)))
+    def test_virada_preserva_limite_do_mes_original(self):
+        self.assertEqual(
+            controle.calcular_datas(date(2026,10,28), date(2026,10,29), {date(2026,11,2)}),
+            (date(2026,11,3), date(2026,10,30)))
+
+    def test_mes_anterior_preserva_vencimento_hoje(self):
+        self.assertEqual(
+            controle.calcular_datas(date(2026,9,30), date(2026,10,20), set()),
+            (date(2026,10,22), date(2026,10,20)))
+
+    def test_sexta_conta_dois_dias_uteis_ate_terca(self):
+        self.assertEqual(
+            controle.calcular_datas(date(2026, 10, 23), date(2026, 10, 23), set()),
+            (date(2026, 10, 27), date(2026, 10, 27)),
+        )
+
+    def test_feriado_no_primeiro_dia_util_nao_conta(self):
+        self.assertEqual(
+            controle.calcular_datas(
+                date(2026, 10, 9), date(2026, 10, 9), {date(2026, 10, 12)}
+            ),
+            (date(2026, 10, 14), date(2026, 10, 14)),
+        )
+
+    def test_execucao_no_sabado_conta_segunda_e_terca(self):
+        self.assertEqual(
+            controle.calcular_datas(date(2026, 10, 17), date(2026, 10, 17), set()),
+            (date(2026, 10, 20), date(2026, 10, 20)),
+        )
+
+    def test_mes_anterior_pode_ser_validado_sem_emissao(self):
+        anterior = row('346')
+        anterior[0] = '30.09.2026'
+        resultado = self.lote([row('345'), anterior], validar=True)
+        self.assertEqual(resultado['validadas'], 2)
+        self.assertEqual(self.issued, [])
+        self.assertEqual(self.sheet.writes, [])
 
     def test_pdf_cnpj_diferente_bloqueia(self):
         def wrong(alvo, antes):
