@@ -294,6 +294,46 @@ def auditar_resumo(driver, wait, alvo):
     return botao
 
 
+def abrir_darj_emitido(driver, wait, alvo):
+    # Confirma a tela de emissão antes de abrir o boleto existente.
+    esperar(
+        driver,
+        wait,
+        lambda d: d.find_element(
+            By.CSS_SELECTOR, 'h1.titulopagina'
+        ).text.strip() == 'DARJ emitido'
+    )
+
+    impressora = esperar_elemento(driver, wait, 'btnGerarDocs')
+    aguardar_ajax(driver, wait)
+
+    quantidade = driver.find_element(
+        By.ID, 'hdnQuantidadeDocs'
+    ).get_attribute('value').strip()
+
+    cnpj = driver.find_element(
+        By.CSS_SELECTOR,
+        "input[name='{pageFlow.documentoForm.cnpjCpf}']"
+    ).get_attribute('value')
+
+    total = driver.find_element(
+        By.ID, 'hdnValorTotal'
+    ).get_attribute('value')
+
+    if quantidade != '1' or re.sub(r'\D', '', cnpj or '') != CNPJ_RESPONSAVEL:
+        raise RuntimeError(
+            'DARJ emitido: quantidade ou CNPJ divergente; '
+            'conferir sem reemitir'
+        )
+
+    if dinheiro(total) != alvo.total:
+        raise RuntimeError(
+            'DARJ emitido: valor divergente; conferir sem reemitir'
+        )
+
+    print('Portal confirmou DARJ emitido. Abrindo o boleto existente...')
+    impressora.click()  # Uma tentativa; sem repetir o clique.
+
 def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90):
     limite = time.monotonic() + timeout
     anterior = None
@@ -302,7 +342,10 @@ def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90):
         arquivos = [p for p in diretorio.glob('*.pdf') if p.name not in anteriores]
         if len(arquivos) > 1:
             raise RuntimeError('Mais de um PDF novo; conferir sem escolher o mais recente')
-        if arquivos and not list(diretorio.glob('*.crdownload')) and not list(diretorio.glob('*.part')):
+        if arquivos and not any(
+            arquivos[0].with_name(arquivos[0].name + sufixo).exists()
+            for sufixo in ('.crdownload', '.part')
+        ):
             arquivo = arquivos[0]
             tamanho = arquivo.stat().st_size
             if tamanho > 0 and anterior == (arquivo.name, tamanho):
@@ -358,6 +401,10 @@ def emitir_portal(alvo, antes_envio):
         anteriores = {p.name for p in diretorio.glob('*.pdf')}
         antes_envio()  # Nova conferência da planilha imediatamente antes de emitir.
         botao.click()  # Tentativa única de geração.
+
+        abrir_darj_emitido(driver, wait, alvo)
+        dump_debug(driver, alvo.linha, 'apos_abrir_boleto')
+
         caminho = aguardar_pdf(driver, diretorio, anteriores, alvo)
         dump_debug(driver, alvo.linha, 'retorno_geracao')
         return caminho
