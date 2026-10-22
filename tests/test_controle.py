@@ -173,24 +173,30 @@ class ControleDARJ(unittest.TestCase):
             controle.calcular_datas(date(2026,9,30), date(2026,10,20), set()),
             (date(2026,10,22), date(2026,10,20)))
 
-    def test_sexta_conta_dois_dias_uteis_ate_terca(self):
+    def test_sexta_dois_corridos_ajusta_para_segunda(self):
         self.assertEqual(
-            controle.calcular_datas(date(2026, 10, 23), date(2026, 10, 23), set()),
-            (date(2026, 10, 27), date(2026, 10, 27)),
-        )
+            controle.calcular_datas(date(2026, 10, 23),date(2026, 10, 23),set(),),
+            (date(2026, 10, 26), date(2026, 10, 26)),
+    )
 
-    def test_feriado_no_primeiro_dia_util_nao_conta(self):
+    def test_segunda_feriado_ajusta_para_terca(self):
         self.assertEqual(
             controle.calcular_datas(
-                date(2026, 10, 9), date(2026, 10, 9), {date(2026, 10, 12)}
+                date(2026, 10, 9),
+                date(2026, 10, 9),
+                {date(2026, 10, 12)},
             ),
-            (date(2026, 10, 14), date(2026, 10, 14)),
+            (date(2026, 10, 13), date(2026, 10, 13)),
         )
 
-    def test_execucao_no_sabado_conta_segunda_e_terca(self):
+    def test_sabado_dois_corridos_resulta_segunda(self):
         self.assertEqual(
-            controle.calcular_datas(date(2026, 10, 17), date(2026, 10, 17), set()),
-            (date(2026, 10, 20), date(2026, 10, 20)),
+            controle.calcular_datas(
+                date(2026, 10, 17),
+                date(2026, 10, 17),
+                set(),
+            ),
+            (date(2026, 10, 19), date(2026, 10, 19)),
         )
 
     def test_mes_anterior_pode_ser_validado_sem_emissao(self):

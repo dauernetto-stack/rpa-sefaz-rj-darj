@@ -94,15 +94,12 @@ def dia_util(dia, feriados):
 
 
 def calcular_datas(entrada, hoje, feriados):
-    """D+2 util confirmado; vencimento segue a regra do projeto original."""
+    """Regra do primeiro ZIP RJ: D+2 corridos, ajustado para dia util."""
     from calendar import monthrange
 
-    pagamento = hoje
-    dias_contados = 0
-    while dias_contados < 2:
+    pagamento = hoje + timedelta(days=2)
+    while not dia_util(pagamento, feriados):
         pagamento += timedelta(days=1)
-        if dia_util(pagamento, feriados):
-            dias_contados += 1
 
     if (pagamento.year, pagamento.month) == (entrada.year, entrada.month):
         vencimento = pagamento
