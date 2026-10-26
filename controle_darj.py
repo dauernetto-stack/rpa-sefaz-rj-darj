@@ -335,7 +335,7 @@ def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
                 raise RuntimeError('Dados ou status mudaram antes da conclusao da linha')
 
             url_pdf = dados['link']
-            formula_link = f'=HYPERLINK("{url_pdf}";"Abrir PDF")'
+            formula_link = f'=HYPERLINK("{url_pdf}";"Link PDF")'
             planilha.update_cell(
                 alvo.linha,
                 colunas['link'],
