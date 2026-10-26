@@ -88,7 +88,10 @@ class ControleDARJ(unittest.TestCase):
         result = self.lote([row('345'), row('346'), row('347')])
         self.assertEqual(self.issued, [3, 4, 5])
         self.assertEqual(result['X'], 3)
-        self.assertEqual(self.sheet.rows[2][10], 'https://drive.google.com/file/d/drive123/view')
+        self.assertEqual(
+            self.sheet.rows[2][10],
+            '=HYPERLINK("https://drive.google.com/file/d/drive123/view";"Link PDF")',
+        )
 
     def test_status_preenchido_nao_e_liberado(self):
         result = self.lote([row(str(i), value) for i,value in enumerate(['X','REVISAR','PROCESSANDO','ERRO'],100)])
