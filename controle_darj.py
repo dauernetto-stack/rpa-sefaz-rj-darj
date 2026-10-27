@@ -143,6 +143,11 @@ def preparar_alvo(linha, registro, hoje, feriados):
     if total <= 0 or icms + fecp != total:
         raise ValueError(f'Linha {linha}: ICMS {brl(icms)} + FECP {brl(fecp)} = {brl(icms + fecp)}, mas total informado = {brl(total)}; conferir centavos e total positivo')
     entrada = parse_data(registro['data'])
+    if entrada.year < 1900:
+        raise ValueError(
+            f'Linha {linha}: Data entrada {registro["data"]!r} tem ano {entrada.year:04d}; '
+            'confira o ano na planilha (minimo 1900). Nenhuma emissao solicitada.'
+        )
     if entrada > hoje:
         raise ValueError(f'Linha {linha}: Data entrada futura')
     pagamento, vencimento = calcular_datas(entrada, hoje, feriados)
@@ -400,6 +405,7 @@ def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
           f'{resultado["ignoradas"]} linhas ignoradas, {resultado["subtotais_conferidos"]} subtotais conferidos.')
     for alvo in pendentes:
         print(f'NF {alvo.nota_raw} | linhas {", ".join(str(n) for n, _ in alvo.origens)} | '
+              f'Entrada {alvo.entrada:%d/%m/%Y} | Periodo {alvo.periodo} | '
               f'ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} = {brl(alvo.total)}')
     if apenas_validar:
         return resultado
