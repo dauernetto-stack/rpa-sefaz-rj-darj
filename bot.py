@@ -231,6 +231,39 @@ def auditar_formulario(driver, wait, alvo):
         raise RuntimeError('Natureza ou produto mudou durante o preenchimento')
     print(f'Auditoria aprovada: ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} = {brl(alvo.total)}')
 
+def preencher_periodo(driver, wait, periodo):
+    """Preenche MM/AAAA completo antes de acionar a validacao original do portal."""
+    if not re.fullmatch(r'(0[1-9]|1[0-2])/\d{4}', str(periodo)):
+        raise ValueError(f'Periodo fora do formato MM/AAAA: {periodo!r}')
+
+    aguardar_ajax(driver, wait)
+    if driver.find_element(By.ID, 'slcTipoPeriodo').get_attribute('value') != 'M':
+        raise RuntimeError('Tipo de periodo diferente de mensal; preenchimento interrompido')
+    campo = esperar_elemento(driver, wait, 'txtPeriodo')
+    if campo.get_property('readOnly'):
+        raise RuntimeError('Campo txtPeriodo permanece somente leitura')
+
+    anterior = campo.get_property('value')
+    print(f'Periodo de referencia: anterior={anterior!r}; esperado={periodo!r}', flush=True)
+    # clear() dispara change com valor vazio. Atribuir o valor completo evita
+    # essa validacao intermediaria; o onchange original continua sendo chamado.
+    driver.execute_script("""
+        const campo = arguments[0], valor = arguments[1];
+        if (!campo.isConnected || campo.disabled || campo.readOnly) {
+            throw new Error('Campo de periodo indisponivel');
+        }
+        campo.value = valor;
+        campo.dispatchEvent(new Event('input', {bubbles: true}));
+        campo.dispatchEvent(new Event('change', {bubbles: true}));
+    """, campo, periodo)
+
+    # Mantem a verificacao de mensagens e aguarda a resposta do portal.
+    # Uma rejeicao continua interrompendo o lote; nao ha repeticao automatica.
+    aguardar_ajax(driver, wait)
+    obtido = driver.find_element(By.ID, 'txtPeriodo').get_property('value')
+    if obtido != periodo:
+        raise RuntimeError(f'Periodo nao confirmado: esperado={periodo!r}; encontrado={obtido!r}')
+    print(f'Periodo de referencia confirmado no campo: {obtido}', flush=True)
 
 def preencher_formulario(driver, wait, alvo):
     driver.get(URL_PORTAL)
@@ -254,7 +287,7 @@ def preencher_formulario(driver, wait, alvo):
     if re.sub(r'\D', '', driver.find_element(By.ID, 'txtCnpjCpf').get_attribute('value')) != CNPJ_RESPONSAVEL:
         raise RuntimeError('CNPJ do formulario divergiu do configurado')
     selecionar(driver, wait, 'slcTipoPeriodo', 'M')
-    preencher(driver, wait, 'txtPeriodo', alvo.periodo)
+    preencher_periodo(driver, wait, alvo.periodo)
     esperar_elemento(driver, wait, 'btnAlterarData').click()
     esperar(driver, wait, lambda d: not d.find_element(By.ID, 'txtDataVencimento').get_property('readOnly'))
     preencher(driver, wait, 'txtDataVencimento', alvo.vencimento.strftime('%d/%m/%Y'))
