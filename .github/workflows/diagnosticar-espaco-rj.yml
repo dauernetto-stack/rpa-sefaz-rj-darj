@@ -1,0 +1,50 @@
+name: RJ - diagnosticar espaco do runner
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emissao-darj-rj
+  cancel-in-progress: false
+
+jobs:
+  diagnostico:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Medir disco e caches sem apagar arquivos
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Runner: %s\n' "$RUNNER_NAME"
+          printf 'Workspace: %s\n' "$GITHUB_WORKSPACE"
+          printf 'Temporarios: %s\n' "$RUNNER_TEMP"
+          printf 'Cache de ferramentas: %s\n' "${RUNNER_TOOL_CACHE:-nao definido}"
+          printf '\nEspaco em disco:\n'
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+          printf '\nInodes disponiveis:\n'
+          df -i "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+
+          for pasta in \
+            "${RUNNER_TOOL_CACHE:-}" \
+            "$RUNNER_TEMP" \
+            "$HOME/.cache/pip" \
+            "$HOME/.cache/selenium" \
+            "$HOME/.wdm" \
+            "$GITHUB_WORKSPACE/diagnosticos" \
+            "$GITHUB_WORKSPACE/downloads_darj"; do
+            if [ -n "$pasta" ] && [ -d "$pasta" ]; then
+              printf '\nTamanho: %s\n' "$pasta"
+              df -h "$pasta"
+              du -x -h --max-depth=2 "$pasta" 2>/dev/null | sort -h | tail -n 20 || true
+            fi
+          done
+
+          printf '\nNavegadores no PATH:\n'
+          for navegador in google-chrome google-chrome-stable chromium chromium-browser chrome; do
+            command -v "$navegador" || true
+          done
+          printf '\nDiagnostico concluido. Nenhum arquivo foi apagado e nenhuma guia foi emitida.\n'
