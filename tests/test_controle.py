@@ -1,4 +1,5 @@
 import importlib
+import re
 import sys
 import tempfile
 import unittest
@@ -24,19 +25,35 @@ class Sheet:
     def __init__(self, rows):
         self.rows = [list(r) for r in rows]
         self.writes = []
-    def row_values(self, line):
-        return list(self.rows[line - 1])
+    def row_values(self, line, value_render_option='FORMATTED_VALUE'):
+        valores = list(self.rows[line - 1]) if line <= len(self.rows) else []
+        if value_render_option == 'FORMULA':
+            return valores
+        return ['Link PDF' if str(v).startswith('=HYPERLINK(') else v for v in valores]
+    def get_all_values(self, value_render_option='FORMATTED_VALUE'):
+        return [self.row_values(n, value_render_option) for n in range(1, len(self.rows) + 1)]
+    def batch_update(self, data, value_input_option='RAW'):
+        for item in data:
+            self.update(item['range'], item['values'], value_input_option)
+    def update(self, range_name, values, value_input_option='RAW'):
+        m = re.fullmatch(r'([A-Z]+)([0-9]+)', range_name)
+        if not m or len(values) != 1 or len(values[0]) != 1:
+            raise AssertionError('Atualizacao de teste inesperada')
+        col = 0
+        for letra in m[1]:
+            col = col * 26 + ord(letra) - 64
+        self.update_cell(int(m[2]), col, values[0][0])
     def update_cell(self, line, column, value):
         target = self.rows[line - 1]
         target.extend([''] * max(0, column - len(target)))
         target[column - 1] = str(value)
         self.writes.append((line, column, str(value)))
 
-def pdf_fixture(path, nota='345', total='120,00', cnpj='58.248.352/0012-01', numero='01234567890123'):
+def pdf_fixture(path, nota='345', total='120,00', cnpj='58.248.352/0012-01', numero='01234567890123', vencimento='22/10/2026'):
     from pypdf import PdfWriter
     from pypdf.generic import NameObject, DictionaryObject, DecodedStreamObject
     text = ['GOVERNO DO ESTADO DO RIO DE JANEIRO', 'DARJ - Documento de Arrecadacao',
-            f'Numero do DARJ: {numero}', 'Data de Vencimento: 22/10/2026',
+            f'Numero do DARJ: {numero}', f'Data de Vencimento: {vencimento}',
             f'Valor Total: R$ {total}', f'CNPJ: {cnpj}', f'Informacoes Complementares: NF {nota}']
     writer = PdfWriter()
     page = writer.add_blank_page(width=600, height=800)
@@ -88,10 +105,7 @@ class ControleDARJ(unittest.TestCase):
         result = self.lote([row('345'), row('346'), row('347')])
         self.assertEqual(self.issued, [3, 4, 5])
         self.assertEqual(result['X'], 3)
-        self.assertEqual(
-            self.sheet.rows[2][10],
-            '=HYPERLINK("https://drive.google.com/file/d/drive123/view";"Link PDF")',
-        )
+        self.assertEqual(self.sheet.rows[2][10], '=HYPERLINK("https://drive.google.com/file/d/drive123/view";"Link PDF")')
 
     def test_status_preenchido_nao_e_liberado(self):
         result = self.lote([row(str(i), value) for i,value in enumerate(['X','REVISAR','PROCESSANDO','ERRO'],100)])
@@ -178,27 +192,21 @@ class ControleDARJ(unittest.TestCase):
 
     def test_sexta_dois_corridos_ajusta_para_segunda(self):
         self.assertEqual(
-            controle.calcular_datas(date(2026, 10, 23),date(2026, 10, 23),set(),),
+            controle.calcular_datas(date(2026, 10, 23), date(2026, 10, 23), set()),
             (date(2026, 10, 26), date(2026, 10, 26)),
-    )
+        )
 
     def test_segunda_feriado_ajusta_para_terca(self):
         self.assertEqual(
             controle.calcular_datas(
-                date(2026, 10, 9),
-                date(2026, 10, 9),
-                {date(2026, 10, 12)},
+                date(2026, 10, 9), date(2026, 10, 9), {date(2026, 10, 12)}
             ),
             (date(2026, 10, 13), date(2026, 10, 13)),
         )
 
     def test_sabado_dois_corridos_resulta_segunda(self):
         self.assertEqual(
-            controle.calcular_datas(
-                date(2026, 10, 17),
-                date(2026, 10, 17),
-                set(),
-            ),
+            controle.calcular_datas(date(2026, 10, 17), date(2026, 10, 17), set()),
             (date(2026, 10, 19), date(2026, 10, 19)),
         )
 

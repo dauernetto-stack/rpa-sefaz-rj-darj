@@ -1,6 +1,6 @@
 """Controle de lote e validações locais. Importar este módulo não acessa serviços."""
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -20,6 +20,7 @@ ALIASES = {
     'status': ['PROC DARJ'], 'numero': ['Nº DARJ', 'N° DARJ', 'Numero DARJ'],
     'vencimento': ['Vcto DARJ', 'Vencimento DARJ'], 'valor': ['Valor DARJ'],
     'link': ['Link DARJ'], 'centro': ['Centro'],
+    'aliquota': ['ALQ ICMS', 'Aliquota ICMS', 'Alíquota ICMS'],
 }
 
 
@@ -28,7 +29,7 @@ def resolver_colunas(cabecalhos):
     for campo, nomes in ALIASES.items():
         indices = [i + 1 for i, h in enumerate(cabecalhos)
                    if normalizar(h) in {normalizar(n) for n in nomes}]
-        if len(indices) > 1 or (not indices and campo != 'centro'):
+        if len(indices) > 1 or (not indices and campo not in ('centro', 'aliquota')):
             raise ValueError(f'Coluna obrigatoria ausente ou ambigua: {nomes[0]}')
         if indices:
             resultado[campo] = indices[0]
@@ -126,6 +127,8 @@ class Alvo:
     pagamento: date
     vencimento: date
     origem: dict
+    origens: tuple = ()
+    subtotal: object = None
 
     @property
     def periodo(self):
@@ -138,7 +141,7 @@ def preparar_alvo(linha, registro, hoje, feriados):
         raise ValueError(f'Linha {linha}: nota fiscal ausente ou fora do formato numero-serie')
     icms, fecp, total = (dinheiro(registro[k]) for k in ('icms', 'fecp', 'total'))
     if total <= 0 or icms + fecp != total:
-        raise ValueError(f'Linha {linha}: ICMS + FECP nao coincide exatamente com o total positivo')
+        raise ValueError(f'Linha {linha}: ICMS {brl(icms)} + FECP {brl(fecp)} = {brl(icms + fecp)}, mas total informado = {brl(total)}; conferir centavos e total positivo')
     entrada = parse_data(registro['data'])
     if entrada > hoje:
         raise ValueError(f'Linha {linha}: Data entrada futura')
@@ -244,76 +247,218 @@ def tipo_linha_estrutural(registro):
     return None
 
 
-def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
-                  apenas_validar=False, intervalo=5, linha_cabecalho=2):
-    colunas, registros = ler_registros(valores, linha_cabecalho)
-    pendentes = []
-    chaves = []
-    estruturais = Counter()
-    x_incompletos = 0
-    for linha, r in registros:
-        tipo = tipo_linha_estrutural(r)
+@dataclass(frozen=True)
+class BlocoNF:
+    linhas: tuple
+    subtotal: object = None
+
+
+CAMPOS_ENTRADA = ('data', 'nota', 'centro', 'aliquota', 'icms', 'fecp', 'total')
+CAMPOS_RESULTADO = ('numero', 'vencimento', 'valor', 'link')
+
+
+def identidade_nota(nota):
+    texto = str(nota).strip()
+    if not re.fullmatch(r'\d+(?:-\d+)?', texto):
+        return texto
+    return tuple(int(parte) for parte in texto.split('-'))
+
+
+def separar_blocos(registros):
+    """Agrupa apenas linhas fisicamente consecutivas; subtotal fecha o grupo."""
+    blocos, atual, estruturais = [], [], Counter()
+    for linha, registro in registros:
+        rotulo = ' '.join(normalizar(registro['nota']).split())
+        if rotulo == 'soma valores':
+            if registro['data'] or registro['status'] or any(
+                registro[c] for c in CAMPOS_RESULTADO
+            ):
+                raise ValueError(f'Linha {linha}: SOMA VALORES deve ser apenas subtotal, sem data/status/dados de guia')
+            if not atual or linha != atual[-1][0] + 1:
+                raise ValueError(f'Linha {linha}: SOMA VALORES sem grupo imediatamente anterior')
+            blocos.append(BlocoNF(tuple(atual), (linha, dict(registro))))
+            atual = []
+            estruturais['subtotal'] += 1
+            continue
+        tipo = tipo_linha_estrutural(registro)
         if tipo:
+            if atual:
+                blocos.append(BlocoNF(tuple(atual)))
+                atual = []
             estruturais[tipo] += 1
             continue
-        if r['nota'] and r['data']:
-            try:
-                chaves.append((r['nota'], parse_data(r['data']).strftime('%Y-%m')))
-            except ValueError:
-                if not r['status']:
-                    raise
-        if r['status']:
-            if normalizar(r['status']) == 'x' and not all(
-                r[campo] for campo in ('numero', 'vencimento', 'valor', 'link')
-            ):
-                x_incompletos += 1
-                print(f'Linha {linha}: X sem dados completos do DARJ; conferir emissao anterior. Status preservado.')
+        continua = (atual and linha == atual[-1][0] + 1
+                    and identidade_nota(registro['nota']) == identidade_nota(atual[0][1]['nota'])
+                    and registro.get('centro', '') == atual[0][1].get('centro', ''))
+        if not continua and atual:
+            blocos.append(BlocoNF(tuple(atual)))
+            atual = []
+        atual.append((linha, dict(registro)))
+    if atual:
+        blocos.append(BlocoNF(tuple(atual)))
+    return blocos, estruturais
+
+
+def chave_bloco(bloco):
+    _, r = bloco.linhas[0]
+    try:
+        periodo = parse_data(r['data']).strftime('%Y-%m')
+    except ValueError:
+        periodo = None
+    return identidade_nota(r['nota']), r.get('centro', ''), periodo
+
+
+def ler_aliquota(valor):
+    texto = str(valor).strip().replace(' ', '').replace(',', '.')
+    porcentagem = texto.endswith('%')
+    if porcentagem:
+        texto = texto[:-1]
+    if not re.fullmatch(r'\d+(?:\.\d+)?', texto):
+        raise ValueError(f'Aliquota invalida ou vazia: {valor!r}')
+    numero = Decimal(texto)
+    if porcentagem or numero > 1:
+        numero /= 100
+    if not Decimal('0') <= numero <= Decimal('1'):
+        raise ValueError(f'Aliquota fora do intervalo de 0% a 100%: {valor!r}')
+    return numero
+
+
+def preparar_grupo(bloco, hoje, feriados):
+    componentes = []
+    aliquotas = set()
+    primeira = bloco.linhas[0][1]
+    for linha, original in bloco.linhas:
+        registro = dict(original)
+        if not registro['data']:
+            registro['data'] = primeira['data']
+        if len(bloco.linhas) > 1:
+            if not original.get('aliquota', ''):
+                raise RuntimeError(f'Linha {linha}: NF repetida exige ALQ ICMS preenchida em cada parcela')
+            aliquota = ler_aliquota(original['aliquota'])
+            if aliquota in aliquotas:
+                raise RuntimeError(f'Linha {linha}: mesma NF e aliquota repetidas; conferir possivel duplicidade')
+            aliquotas.add(aliquota)
+        parte = preparar_alvo(linha, registro, hoje, feriados)
+        if componentes and parte.entrada != componentes[0].entrada:
+            raise ValueError(f'Linha {linha}: datas de entrada diferentes dentro da mesma NF')
+        componentes.append(parte)
+    icms = sum((p.icms for p in componentes), Decimal('0.00'))
+    fecp = sum((p.fecp for p in componentes), Decimal('0.00'))
+    total = icms + fecp
+    if bloco.subtotal:
+        linha, registro = bloco.subtotal
+        for campo, esperado in (('icms', icms), ('fecp', fecp), ('total', total)):
+            recebido = dinheiro(registro[campo])
+            if recebido != esperado:
+                raise ValueError(f'Linha {linha}: subtotal {campo} {brl(recebido)} difere da soma das parcelas {brl(esperado)}')
+    return replace(componentes[0], icms=icms, fecp=fecp, total=total,
+                   origem=dict(primeira), origens=bloco.linhas, subtotal=bloco.subtotal)
+
+
+def planejar_lote(valores, hoje, feriados, linha_cabecalho):
+    colunas, registros = ler_registros(valores, linha_cabecalho)
+    blocos, estruturais = separar_blocos(registros)
+    contagem = Counter(chave_bloco(b) for b in blocos)
+    pendentes, x_incompletos = [], 0
+    for bloco in blocos:
+        marcadas = [bool(r['status']) for _, r in bloco.linhas]
+        if any(marcadas) and not all(marcadas):
+            raise RuntimeError(f'NF {bloco.linhas[0][1]["nota"]}: grupo parcialmente processado; conferir a guia existente sem reemitir')
+        if all(marcadas):
+            for linha, r in bloco.linhas:
+                if normalizar(r['status']) == 'x' and not all(r[c] for c in CAMPOS_RESULTADO):
+                    x_incompletos += 1
+                    print(f'Linha {linha}: X sem dados completos do DARJ; conferir emissao anterior. Status preservado.')
             continue
-        if r['numero'] or r['link']:
-            raise RuntimeError(f'Linha {linha}: ja possui numero ou link; conferir sem reemitir')
-        pendentes.append(preparar_alvo(linha, r, hoje, feriados))
-    contagem = Counter(chaves)
-    for alvo in pendentes:
-        if contagem[(alvo.nota_raw, alvo.entrada.strftime('%Y-%m'))] > 1:
-            raise RuntimeError(f'Linha {alvo.linha}: nota repetida no mesmo periodo; conferir antes de emitir')
-    resultado = {'X': 0, 'ignoradas': len(registros) - len(pendentes), 'validadas': len(pendentes),
+        for linha, r in bloco.linhas:
+            if any(r[c] for c in CAMPOS_RESULTADO):
+                raise RuntimeError(f'Linha {linha}: ja possui dados de guia; conferir sem reemitir')
+        if contagem[chave_bloco(bloco)] > 1:
+            raise RuntimeError(f'NF {bloco.linhas[0][1]["nota"]}: aparece em blocos separados no mesmo periodo; reunir/conferir antes de emitir')
+        pendentes.append(preparar_grupo(bloco, hoje, feriados))
+    linhas_pendentes = sum(len(a.origens) for a in pendentes)
+    resultado = {'X': 0, 'linhas_concluidas': 0, 'ignoradas': len(registros) - linhas_pendentes,
+                 'validadas': len(pendentes), 'linhas_validadas': linhas_pendentes,
                  'modelos_ignorados': estruturais['modelo'], 'totais_ignorados': estruturais['total'],
+                 'subtotais_conferidos': sum(bool(a.subtotal) for a in pendentes),
                  'x_incompletos': x_incompletos}
-    print(f'Lote: {len(pendentes)} pendentes validadas; {resultado["ignoradas"]} linhas ignoradas '
-          f'({estruturais["modelo"]} modelos e {estruturais["total"]} totais).')
+    return colunas, pendentes, resultado
+
+
+def endereco_celula(linha, coluna):
+    letras = ''
+    while coluna:
+        coluna, resto = divmod(coluna - 1, 26)
+        letras = chr(65 + resto) + letras
+    return f'{letras}{linha}'
+
+
+def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
+                  apenas_validar=False, intervalo=5, linha_cabecalho=2):
+    colunas, pendentes, resultado = planejar_lote(valores, hoje, feriados, linha_cabecalho)
+    print(f'Lote: {len(pendentes)} guias pendentes validadas, {resultado["linhas_validadas"]} linhas; '
+          f'{resultado["ignoradas"]} linhas ignoradas, {resultado["subtotais_conferidos"]} subtotais conferidos.')
+    for alvo in pendentes:
+        print(f'NF {alvo.nota_raw} | linhas {", ".join(str(n) for n, _ in alvo.origens)} | '
+              f'ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} = {brl(alvo.total)}')
     if apenas_validar:
         return resultado
 
-    def ler_atual(alvo, status):
-        if resolver_colunas(planilha.row_values(linha_cabecalho)) != colunas:
+    def ler_atual(alvo, status, dados=None, formula=None):
+        # Uma leitura integral identifica parcelas inseridas/removidas e novos blocos duplicados.
+        atuais = planilha.get_all_values(value_render_option='FORMATTED_VALUE')
+        atuais_colunas, registros = ler_registros(atuais, linha_cabecalho)
+        if atuais_colunas != colunas:
             raise RuntimeError('Cabecalhos foram alterados durante o lote')
-        atual = registro_da_linha(planilha.row_values(alvo.linha), colunas)
-        if atual['status'] != status:
-            raise RuntimeError(f'Linha {alvo.linha}: status mudou durante o processamento')
-        if atual['numero'] or atual['link']:
-            raise RuntimeError(f'Linha {alvo.linha}: numero/link apareceu durante o processamento')
-        for campo in ('data', 'nota', 'centro', 'icms', 'fecp', 'total'):
-            if atual.get(campo, '') != alvo.origem.get(campo, ''):
-                raise RuntimeError(f'Linha {alvo.linha}: campo {campo} alterado durante o processamento')
+        blocos, _ = separar_blocos(registros)
+        candidatos = [b for b in blocos if b.linhas[0][0] == alvo.linha]
+        if len(candidatos) != 1:
+            raise RuntimeError('Grupo da NF mudou de posicao durante o lote')
+        bloco = candidatos[0]
+        if tuple(n for n, _ in bloco.linhas) != tuple(n for n, _ in alvo.origens):
+            raise RuntimeError('Parcelas da NF foram inseridas ou removidas durante o lote')
+        if bloco.subtotal != alvo.subtotal:
+            raise RuntimeError('Subtotal da NF foi alterado durante o lote')
+        chave = (identidade_nota(alvo.nota_raw), alvo.centro, alvo.entrada.strftime('%Y-%m'))
+        if sum(chave_bloco(b) == chave for b in blocos) != 1:
+            raise RuntimeError('Outra ocorrencia da NF apareceu durante o lote')
+        formulas = planilha.get_all_values(value_render_option='FORMULA') if dados else None
+        for (linha, atual), (_, original) in zip(bloco.linhas, alvo.origens):
+            if any(atual.get(c, '') != original.get(c, '') for c in CAMPOS_ENTRADA):
+                raise RuntimeError(f'Linha {linha}: dados alterados durante o processamento')
+            if atual['status'] != status:
+                raise RuntimeError(f'Linha {linha}: status mudou durante o processamento')
+            if dados is None:
+                if any(atual[c] for c in CAMPOS_RESULTADO):
+                    raise RuntimeError(f'Linha {linha}: dados de guia apareceram durante o processamento')
+            else:
+                if any(atual[c] != dados[c] for c in ('numero', 'vencimento', 'valor')):
+                    raise RuntimeError(f'Linha {linha}: gravacao dos resultados nao confirmada')
+                if atual['link'] not in ('Link PDF', formula):
+                    raise RuntimeError(f'Linha {linha}: Link PDF nao confirmado')
+                linha_formulas = formulas[linha - 1] if len(formulas) >= linha else []
+                link = str(linha_formulas[colunas['link'] - 1]) if len(linha_formulas) >= colunas['link'] else ''
+                # A leitura formatada so mostra o rotulo. Conferir tambem o destino da formula.
+                padrao = r'=HYPERLINK\(\s*"' + re.escape(dados['link']) + r'"\s*[;,]\s*"Link PDF"\s*\)'
+                if not re.fullmatch(padrao, link, re.IGNORECASE):
+                    raise RuntimeError(f'Linha {linha}: destino do Link PDF nao confirmado')
 
     for indice, alvo in enumerate(pendentes):
-        # Nova leitura antes de reservar: outra execucao pode ter terminado esta linha.
-        atual = registro_da_linha(planilha.row_values(alvo.linha), colunas)
-        if atual['status']:
-            resultado['ignoradas'] += 1
-            continue
         ler_atual(alvo, '')
-        planilha.update_cell(alvo.linha, colunas['status'], 'PROCESSANDO')
         estado = {'envio': False}
+        reservadas = []
 
         def antes_envio():
             ler_atual(alvo, 'PROCESSANDO')
-            # Conservador: inclusive Confirmar item fica fora de qualquer retry.
             estado['envio'] = True
 
         try:
+            reservadas = [linha for linha, _ in alvo.origens]
+            planilha.batch_update([
+                {'range': endereco_celula(linha, colunas['status']), 'values': [['PROCESSANDO']]}
+                for linha in reservadas
+            ], value_input_option='RAW')
             ler_atual(alvo, 'PROCESSANDO')
-            print(f'Linha {alvo.linha} | NF {alvo.nota_raw} | ICMS {brl(alvo.icms)} | FECP {brl(alvo.fecp)}')
             caminho = emitir(alvo, antes_envio)
             if not estado['envio']:
                 raise RuntimeError('Retorno sem registro do envio ao portal')
@@ -323,34 +468,45 @@ def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
                 raise RuntimeError('Drive nao confirmou o ID do PDF')
             ler_atual(alvo, 'PROCESSANDO')
             dados['link'] = f'https://drive.google.com/file/d/{file_id}/view'
-            for campo, valor in dados.items():
-                planilha.update_cell(alvo.linha, colunas[campo], valor)
-            gravado = registro_da_linha(planilha.row_values(alvo.linha), colunas)
-            if any(gravado[campo] != valor for campo, valor in dados.items()):
-                raise RuntimeError('Nao foi possivel confirmar a gravacao dos resultados')
-            if (gravado['status'] != 'PROCESSANDO' or any(
-                gravado.get(campo, '') != alvo.origem.get(campo, '')
-                for campo in ('data', 'nota', 'centro', 'icms', 'fecp', 'total')
-            )):
-                raise RuntimeError('Dados ou status mudaram antes da conclusao da linha')
-
-            url_pdf = dados['link']
-            formula_link = f'=HYPERLINK("{url_pdf}";"Link PDF")'
-            planilha.update_cell(
-                alvo.linha,
-                colunas['link'],
-                formula_link,
-            )
-
-            planilha.update_cell(alvo.linha, colunas['status'], 'X')
-            resultado['X'] += 1
+            formula = f'=HYPERLINK("{dados["link"]}";"Link PDF")'
+            # RAW preserva os 25 digitos do DARJ. Escritas em lote reduzem chamadas ao Sheets.
+            planilha.batch_update([
+                {'range': endereco_celula(linha, colunas[campo]), 'values': [[dados[campo]]]}
+                for linha in reservadas for campo in ('numero', 'vencimento', 'valor')
+            ], value_input_option='RAW')
+            planilha.batch_update([
+                {'range': endereco_celula(linha, colunas['link']), 'values': [[formula]]}
+                for linha in reservadas
+            ], value_input_option='USER_ENTERED')
+            ler_atual(alvo, 'PROCESSANDO', dados, formula)
+            planilha.batch_update([
+                {'range': endereco_celula(linha, colunas['status']), 'values': [['X']]}
+                for linha in reservadas
+            ], value_input_option='RAW')
+            ler_atual(alvo, 'X', dados, formula)
+            resultado['X'] += 1  # Conta guias, nao parcelas.
+            resultado['linhas_concluidas'] += len(alvo.origens)
         except Exception as exc:
             status = 'REVISAR' if estado['envio'] else 'ERRO'
-            try:
-                planilha.update_cell(alvo.linha, colunas['status'], status)
-            except Exception as erro_status:
-                raise RuntimeError(f'Linha {alvo.linha}: falha e status nao confirmado; manter bloqueada') from erro_status
-            raise RuntimeError(f'Linha {alvo.linha}: {status}; lote interrompido sem repetir a emissao: {exc}') from exc
+            falhas_status = []
+            originais = dict(alvo.origens)
+            for linha in reservadas:
+                try:
+                    # Se linhas/colunas mudaram, nao sobrescrever o status de outra NF.
+                    cabecalho = planilha.row_values(linha_cabecalho)
+                    if resolver_colunas(cabecalho) != colunas:
+                        raise RuntimeError('cabecalhos alterados; status preservado')
+                    atual = registro_da_linha(planilha.row_values(linha), colunas)
+                    original = originais[linha]
+                    if (identidade_nota(atual['nota']) != identidade_nota(original['nota'])
+                            or atual.get('centro', '') != original.get('centro', '')):
+                        raise RuntimeError('linha pertence a outra NF/centro; status preservado')
+                    planilha.update_cell(linha, colunas['status'], status)
+                except Exception as erro_status:
+                    falhas_status.append(f'{linha}: {erro_status}')
+            if falhas_status:
+                raise RuntimeError(f'NF {alvo.nota_raw}: {exc}; status nao confirmado em {falhas_status}; conferir o grupo sem reemitir') from exc
+            raise RuntimeError(f'NF {alvo.nota_raw}, linha {alvo.linha}: {status}; lote interrompido sem repetir a emissao: {exc}') from exc
         if intervalo and indice + 1 < len(pendentes):
             time.sleep(intervalo)
     return resultado
