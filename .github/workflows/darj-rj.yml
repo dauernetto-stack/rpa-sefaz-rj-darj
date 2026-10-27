@@ -32,8 +32,49 @@ jobs:
       - name: Instalar dependencias
         run: python3 -m pip install --break-system-packages -r requirements.txt
 
-      - name: Instalar Google Chrome
-        uses: browser-actions/setup-chrome@v1
+      - name: Usar Chrome instalado e liberar cache antigo
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          raiz = Path(os.environ['RUNNER_TOOL_CACHE']).resolve()
+          cache = Path('/home/ghrunner/actions-runner/_work/_tool/setup-chrome/chromium')
+          chrome = Path('/usr/bin/google-chrome')
+
+          if raiz / 'setup-chrome' / 'chromium' != cache:
+              raise RuntimeError('Cache do runner diferente do caminho conferido; limpeza cancelada')
+          if cache.resolve() != cache or cache.is_symlink():
+              raise RuntimeError('Cache aponta para outro caminho; limpeza cancelada')
+          if chrome.resolve(strict=True).is_relative_to(cache):
+              raise RuntimeError('Chrome depende do cache; limpeza cancelada')
+
+          subprocess.run([str(chrome), '--version'], check=True)
+
+          for executavel in Path('/proc').glob('[0-9]*/exe'):
+              try:
+                  caminho = executavel.readlink()
+              except OSError:
+                  continue
+              if caminho.is_relative_to(cache):
+                  raise RuntimeError('Existe navegador usando esse cache; limpeza cancelada')
+
+          antes = shutil.disk_usage(raiz).free
+          if cache.exists():
+              print(f'Removendo somente o cache: {cache}', flush=True)
+              shutil.rmtree(cache)
+          else:
+              print('O cache antigo ja foi removido.')
+          depois = shutil.disk_usage(raiz).free
+          print(f'Espaco livre antes: {antes / 1024**3:.2f} GiB')
+          print(f'Espaco livre depois: {depois / 1024**3:.2f} GiB')
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as arquivo:
+              arquivo.write(f'CHROME_BINARY={chrome}\n')
+          PY
 
       - name: Validar os testes locais
         run: python3 -m unittest discover -s tests -v
