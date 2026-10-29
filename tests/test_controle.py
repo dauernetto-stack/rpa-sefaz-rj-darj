@@ -183,7 +183,7 @@ class ControleDARJ(unittest.TestCase):
     def test_virada_preserva_limite_do_mes_original(self):
         self.assertEqual(
             controle.calcular_datas(date(2026,10,28), date(2026,10,29), {date(2026,11,2)}),
-            (date(2026,11,3), date(2026,10,30)))
+            (date(2026,10,30), date(2026,10,30)))
 
     def test_mes_anterior_preserva_vencimento_hoje(self):
         self.assertEqual(

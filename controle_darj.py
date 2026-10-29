@@ -95,21 +95,33 @@ def dia_util(dia, feriados):
 
 
 def calcular_datas(entrada, hoje, feriados):
-    """Regra do primeiro ZIP RJ: D+2 corridos, ajustado para dia util."""
+    """D+2 corridos, limitado ao fechamento vigente."""
     from calendar import monthrange
 
     pagamento = hoje + timedelta(days=2)
     while not dia_util(pagamento, feriados):
         pagamento += timedelta(days=1)
 
-    if (pagamento.year, pagamento.month) == (entrada.year, entrada.month):
+    if (pagamento.year, pagamento.month) == (
+        entrada.year, entrada.month
+    ):
         vencimento = pagamento
     else:
-        ultimo_dia = monthrange(entrada.year, entrada.month)[1]
-        limite = date(entrada.year, entrada.month, ultimo_dia)
+        ultimo_dia = monthrange(
+            entrada.year, entrada.month
+        )[1]
+
+        limite = date(
+            entrada.year, entrada.month, ultimo_dia
+        )
         while not dia_util(limite, feriados):
             limite -= timedelta(days=1)
+
         vencimento = limite if limite >= hoje else hoje
+
+        # Antecipa o pagamento para o fechamento.
+        if limite >= hoje:
+            pagamento = min(pagamento, limite)
 
     return pagamento, vencimento
 
