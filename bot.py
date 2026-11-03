@@ -216,7 +216,30 @@ def auditar_formulario(driver, wait, alvo):
         return (valores == [alvo.icms, alvo.fecp, alvo.icms, alvo.fecp]
                 and valores[2] + valores[3] == alvo.total)
     aguardar_ajax(driver, wait)
-    esperar(driver, wait, confere)
+    from selenium.common.exceptions import TimeoutException
+    try:
+        esperar(driver, wait, confere)
+    except TimeoutException as exc:
+        campos = (
+            'txtIcmsInformado', 'txtFecpInformado',
+            'txtTotalIcms', 'txtTotalFecp',
+            'txtMoraIcms', 'txtMultaMoraIcms',
+            'txtMoraFecp', 'txtMultaMoraFecp',
+            'txtDataPagamento', 'txtDataVencimento', 'txtPeriodo',
+        )
+        detalhes = []
+        for campo in campos:
+            try:
+                valor = driver.find_element(By.ID, campo).get_attribute('value')
+            except Exception:
+                valor = 'indisponivel'
+            detalhes.append(f'{campo}={valor!r}')
+        raise RuntimeError(
+            f'Auditoria bloqueada: esperado ICMS {brl(alvo.icms)} + '
+            f'FECP {brl(alvo.fecp)} = {brl(alvo.total)}. '
+            'Valores/datas observados no portal: ' + '; '.join(detalhes)
+            + '. Nenhum item confirmado nesta tentativa; conferir divergencias.'
+        ) from exc
     if driver.find_element(By.ID, 'btnAlterarDataPagamento').get_attribute('value').strip() != 'Alterar':
         raise RuntimeError('Data de Pagamento ainda aguarda confirmacao')
     for campo, esperado in [('txtDataPagamento', alvo.pagamento.strftime('%d/%m/%Y')),
@@ -230,6 +253,7 @@ def auditar_formulario(driver, wait, alvo):
             or driver.find_element(By.ID, 'slcListaProduto').get_attribute('value') != '442'):
         raise RuntimeError('Natureza ou produto mudou durante o preenchimento')
     print(f'Auditoria aprovada: ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} = {brl(alvo.total)}')
+
 
 def preencher_periodo(driver, wait, periodo):
     """Preenche MM/AAAA completo antes de acionar a validacao original do portal."""
