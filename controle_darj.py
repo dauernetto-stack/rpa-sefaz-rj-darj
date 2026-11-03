@@ -172,7 +172,81 @@ def preparar_alvo(linha, registro, hoje, feriados):
                 entrada, icms, fecp, total, pagamento, vencimento, dict(registro))
 
 
-def extrair_dados_pdf(texto, alvo, cnpj):
+@dataclass(frozen=True)
+class CalculoPortal:
+    """Principal e encargos auditados; nunca substitui os dados de entrada."""
+    icms: Decimal
+    fecp: Decimal
+    mora_icms: Decimal
+    multa_icms: Decimal
+    mora_fecp: Decimal
+    multa_fecp: Decimal
+    total_icms: Decimal
+    total_fecp: Decimal
+
+    @property
+    def total(self):
+        return self.total_icms + self.total_fecp
+
+    @property
+    def encargos(self):
+        return self.mora_icms + self.multa_icms + self.mora_fecp + self.multa_fecp
+
+    def validar(self, alvo):
+        for nome in self.__dataclass_fields__:
+            valor = getattr(self, nome)
+            if not isinstance(valor, Decimal):
+                raise ValueError(f'Calculo do portal: {nome} precisa ser Decimal')
+            dinheiro(valor)  # Exige valor finito, nao negativo e centavos exatos.
+        if alvo.icms + alvo.fecp != alvo.total or alvo.total <= 0:
+            raise ValueError('Principal do alvo inconsistente')
+        if self.icms != alvo.icms or self.fecp != alvo.fecp:
+            raise ValueError('Principal informado no portal difere da planilha')
+        if self.total_icms != self.icms + self.mora_icms + self.multa_icms:
+            raise ValueError('Total ICMS nao confere com principal + mora + multa')
+        if self.total_fecp != self.fecp + self.mora_fecp + self.multa_fecp:
+            raise ValueError('Total FECP nao confere com principal + mora + multa')
+        if self.total != alvo.total + self.encargos:
+            raise ValueError('Total final do portal inconsistente')
+        if self.encargos and alvo.pagamento <= alvo.vencimento:
+            raise ValueError('Encargos inesperados para pagamento sem atraso')
+        return self
+
+
+@dataclass(frozen=True)
+class EmissaoPortal:
+    caminho: Path
+    calculo: CalculoPortal
+
+
+def conferir_calculo_portal(alvo, campos):
+    mapeamento = {
+        'icms': 'txtIcmsInformado', 'fecp': 'txtFecpInformado',
+        'mora_icms': 'txtMoraIcms', 'multa_icms': 'txtMultaMoraIcms',
+        'mora_fecp': 'txtMoraFecp', 'multa_fecp': 'txtMultaMoraFecp',
+        'total_icms': 'txtTotalIcms', 'total_fecp': 'txtTotalFecp',
+    }
+    try:
+        valores = {nome: dinheiro(campos[campo]) for nome, campo in mapeamento.items()}
+        atualizado_icms = dinheiro(campos['txtIcmsAtualizado'])
+        atualizado_fecp = dinheiro(campos['txtFecpAtualizado'])
+    except KeyError as exc:
+        raise ValueError(f'Campo obrigatorio do calculo ausente: {exc.args[0]}') from exc
+    if atualizado_icms != alvo.icms or atualizado_fecp != alvo.fecp:
+        raise ValueError('Principal atualizado divergiu; correcao monetaria exige conferencia manual')
+    return CalculoPortal(**valores).validar(alvo)
+
+
+def total_esperado(alvo, calculo=None):
+    if calculo is None:
+        return alvo.total
+    if not isinstance(calculo, CalculoPortal):
+        raise ValueError('Calculo do portal ausente ou invalido')
+    return calculo.validar(alvo).total
+
+
+def extrair_dados_pdf(texto, alvo, cnpj, calculo=None):
+    esperado = total_esperado(alvo, calculo)
     texto = normalizar(texto)
     if 'darj' not in texto:
         raise ValueError('O PDF nao foi identificado como DARJ')
@@ -223,13 +297,13 @@ def extrair_dados_pdf(texto, alvo, cnpj):
     padrao_valor = r'(?<![\d.,/])(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}(?![\d.,/])'
     valores = {dinheiro(v) for v in ler_campo(
         r'(?:valor\s+total|total\s+a\s+pagar)', padrao_valor)}
-    if valores != {alvo.total}:
+    if valores != {esperado}:
         raise ValueError('Valor total do PDF ausente, ambiguo ou divergente')
     return {'numero': numeros.pop(), 'vencimento': alvo.vencimento.strftime('%d/%m/%Y'),
-            'valor': brl(alvo.total)}
+            'valor': brl(esperado)}
 
 
-def validar_pdf(caminho, alvo, cnpj):
+def validar_pdf(caminho, alvo, cnpj, calculo=None):
     from pypdf import PdfReader
     caminho = Path(caminho)
     with caminho.open('rb') as arquivo:
@@ -239,7 +313,7 @@ def validar_pdf(caminho, alvo, cnpj):
     if leitor.is_encrypted:
         raise ValueError('PDF protegido; conferir manualmente')
     texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
-    dados = extrair_dados_pdf(texto, alvo, cnpj)
+    dados = extrair_dados_pdf(texto, alvo, cnpj, calculo)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
     nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota}_{dados['numero']}.pdf"
     destino = caminho.with_name(nome)
@@ -482,10 +556,18 @@ def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
                 for linha in reservadas
             ], value_input_option='RAW')
             ler_atual(alvo, 'PROCESSANDO')
-            caminho = emitir(alvo, antes_envio)
+            retorno = emitir(alvo, antes_envio)
             if not estado['envio']:
                 raise RuntimeError('Retorno sem registro do envio ao portal')
-            caminho, dados = validar_pdf(caminho, alvo, cnpj)
+            if isinstance(retorno, EmissaoPortal):
+                caminho, calculo = retorno.caminho, retorno.calculo
+                if not isinstance(calculo, CalculoPortal):
+                    raise ValueError('Retorno sem calculo auditado do portal')
+                calculo.validar(alvo)
+            else:
+                # Compatibilidade com emissores antigos: continuam sem aceitar encargos.
+                caminho, calculo = retorno, None
+            caminho, dados = validar_pdf(caminho, alvo, cnpj, calculo)
             file_id = subir_pdf(caminho)
             if not isinstance(file_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', file_id):
                 raise RuntimeError('Drive nao confirmou o ID do PDF')

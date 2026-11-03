@@ -207,38 +207,39 @@ def dump_debug(driver, linha, etapa):
 
 
 def auditar_formulario(driver, wait, alvo):
-    def confere(d):
-        ids = ('txtIcmsInformado', 'txtFecpInformado', 'txtTotalIcms', 'txtTotalFecp')
-        try:
-            valores = [dinheiro(d.find_element(By.ID, campo).get_attribute('value')) for campo in ids]
-        except ValueError:
-            return False
-        return (valores == [alvo.icms, alvo.fecp, alvo.icms, alvo.fecp]
-                and valores[2] + valores[3] == alvo.total)
-    aguardar_ajax(driver, wait)
+    from controle_darj import conferir_calculo_portal
     from selenium.common.exceptions import TimeoutException
+    ids = (
+        'txtIcmsInformado', 'txtFecpInformado',
+        'txtIcmsAtualizado', 'txtFecpAtualizado',
+        'txtMoraIcms', 'txtMultaMoraIcms', 'txtTotalIcms',
+        'txtMoraFecp', 'txtMultaMoraFecp', 'txtTotalFecp',
+    )
+    ultimo = {'campos': {}, 'motivo': 'Calculo ainda nao carregado'}
+
+    def confere(d):
+        campos = {campo: d.find_element(By.ID, campo).get_attribute('value') for campo in ids}
+        ultimo['campos'] = campos
+        try:
+            return conferir_calculo_portal(alvo, campos)
+        except ValueError as exc:
+            ultimo['motivo'] = str(exc)
+            return False
+
+    aguardar_ajax(driver, wait)
     try:
-        esperar(driver, wait, confere)
+        calculo = esperar(driver, wait, confere)
     except TimeoutException as exc:
-        campos = (
-            'txtIcmsInformado', 'txtFecpInformado',
-            'txtTotalIcms', 'txtTotalFecp',
-            'txtMoraIcms', 'txtMultaMoraIcms',
-            'txtMoraFecp', 'txtMultaMoraFecp',
-            'txtDataPagamento', 'txtDataVencimento', 'txtPeriodo',
-        )
-        detalhes = []
-        for campo in campos:
+        detalhes = dict(ultimo['campos'])
+        for campo in ('txtDataPagamento', 'txtDataVencimento', 'txtPeriodo'):
             try:
-                valor = driver.find_element(By.ID, campo).get_attribute('value')
+                detalhes[campo] = driver.find_element(By.ID, campo).get_attribute('value')
             except Exception:
-                valor = 'indisponivel'
-            detalhes.append(f'{campo}={valor!r}')
+                detalhes[campo] = 'indisponivel'
         raise RuntimeError(
-            f'Auditoria bloqueada: esperado ICMS {brl(alvo.icms)} + '
-            f'FECP {brl(alvo.fecp)} = {brl(alvo.total)}. '
-            'Valores/datas observados no portal: ' + '; '.join(detalhes)
-            + '. Nenhum item confirmado nesta tentativa; conferir divergencias.'
+            f'Auditoria bloqueada: {ultimo["motivo"]}. '
+            f'Principal esperado: ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} '
+            f'= {brl(alvo.total)}. Campos: {detalhes}. Nenhum item confirmado nesta tentativa.'
         ) from exc
     if driver.find_element(By.ID, 'btnAlterarDataPagamento').get_attribute('value').strip() != 'Alterar':
         raise RuntimeError('Data de Pagamento ainda aguarda confirmacao')
@@ -252,7 +253,11 @@ def auditar_formulario(driver, wait, alvo):
     if (driver.find_element(By.ID, 'slcNaturezaLista').get_attribute('value') != '4'
             or driver.find_element(By.ID, 'slcListaProduto').get_attribute('value') != '442'):
         raise RuntimeError('Natureza ou produto mudou durante o preenchimento')
-    print(f'Auditoria aprovada: ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} = {brl(alvo.total)}')
+    print(f'Auditoria aprovada: principal {brl(alvo.total)} + encargos '
+          f'{brl(calculo.encargos)} = total final {brl(calculo.total)}')
+    print(f'Encargos do portal: ICMS mora {brl(calculo.mora_icms)}, multa {brl(calculo.multa_icms)}; '
+          f'FECP mora {brl(calculo.mora_fecp)}, multa {brl(calculo.multa_fecp)}')
+    return calculo
 
 
 def preencher_periodo(driver, wait, periodo):
@@ -321,7 +326,7 @@ def preencher_formulario(driver, wait, alvo):
     esperar_elemento(driver, wait, 'okIcms').click()
     aguardar_ajax(driver, wait)
     esperar_elemento(driver, wait, 'okFecp').click()
-    auditar_formulario(driver, wait, alvo)
+    return auditar_formulario(driver, wait, alvo)
 
 
 XPATH_GERAR = "//input[@type='button' and contains(@value,'Gerar DARJ')] | //button[normalize-space(.)='Gerar DARJ'] | //a[normalize-space(.)='Gerar DARJ']"
@@ -334,7 +339,9 @@ def botao_gerar_unico(driver):
     return candidatos[0] if candidatos else False
 
 
-def auditar_resumo(driver, wait, alvo):
+def auditar_resumo(driver, wait, alvo, calculo=None):
+    from controle_darj import total_esperado
+    esperado = total_esperado(alvo, calculo)
     botao = esperar(driver, wait, botao_gerar_unico)
     quantidade = driver.find_element(By.ID, 'hdnQuantidadeDocs').get_attribute('value').strip()
     if quantidade != '1':
@@ -346,12 +353,14 @@ def auditar_resumo(driver, wait, alvo):
     if itens and not itens[0].is_selected():
         itens[0].click()
     aguardar_ajax(driver, wait)
-    if dinheiro(driver.find_element(By.ID, 'hdnValorTotal').get_attribute('value')) != alvo.total:
-        raise RuntimeError('Valor total do resumo diverge da planilha')
+    if dinheiro(driver.find_element(By.ID, 'hdnValorTotal').get_attribute('value')) != esperado:
+        raise RuntimeError('Valor total do resumo diverge do calculo auditado')
     return botao
 
 
-def abrir_darj_emitido(driver, wait, alvo):
+def abrir_darj_emitido(driver, wait, alvo, calculo=None):
+    from controle_darj import total_esperado
+    esperado = total_esperado(alvo, calculo)
     # Confirma a tela de emissão antes de abrir o boleto existente.
     esperar(
         driver,
@@ -383,7 +392,7 @@ def abrir_darj_emitido(driver, wait, alvo):
             'conferir sem reemitir'
         )
 
-    if dinheiro(total) != alvo.total:
+    if dinheiro(total) != esperado:
         raise RuntimeError(
             'DARJ emitido: valor divergente; conferir sem reemitir'
         )
@@ -391,7 +400,7 @@ def abrir_darj_emitido(driver, wait, alvo):
     print('Portal confirmou DARJ emitido. Abrindo o boleto existente...')
     impressora.click()  # Uma tentativa; sem repetir o clique.
 
-def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90):
+def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90, calculo=None):
     limite = time.monotonic() + timeout
     anterior = None
     while time.monotonic() < limite:
@@ -422,7 +431,7 @@ def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90):
                 if not conteudo or not conteudo['pronto']:
                     continue
                 try:
-                    extrair_dados_pdf(conteudo['texto'], alvo, CNPJ_RESPONSAVEL)
+                    extrair_dados_pdf(conteudo['texto'], alvo, CNPJ_RESPONSAVEL, calculo)
                 except ValueError:
                     continue
                 linha_digitavel = any(44 <= len(re.sub(r'\D', '', linha)) <= 48
@@ -441,30 +450,34 @@ def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90):
 
 
 def emitir_portal(alvo, antes_envio):
+    from controle_darj import EmissaoPortal, CalculoPortal
     diretorio = BASE / 'downloads_darj' / f'linha_{alvo.linha}_{uuid.uuid4().hex[:10]}'
     diretorio.mkdir(parents=True)
     driver = None
     try:
         driver, wait = criar_driver(diretorio)
-        preencher_formulario(driver, wait, alvo)
+        calculo = preencher_formulario(driver, wait, alvo)
+        if not isinstance(calculo, CalculoPortal):
+            raise RuntimeError('Formulario nao retornou calculo auditado; nenhum item confirmado')
+        calculo.validar(alvo)
         dump_debug(driver, alvo.linha, 'antes_confirmar_item')
         confirmar = esperar(driver, wait, EC.element_to_be_clickable((
             By.XPATH, "//input[@type='button' and contains(@value,'Confirmar item')]"
         )))
         antes_envio()
         confirmar.click()  # Tentativa única, inclusive nesta inclusão no resumo.
-        botao = auditar_resumo(driver, wait, alvo)
+        botao = auditar_resumo(driver, wait, alvo, calculo)
         dump_debug(driver, alvo.linha, 'antes_gerar')
         anteriores = {p.name for p in diretorio.glob('*.pdf')}
         antes_envio()  # Nova conferência da planilha imediatamente antes de emitir.
         botao.click()  # Tentativa única de geração.
 
-        abrir_darj_emitido(driver, wait, alvo)
+        abrir_darj_emitido(driver, wait, alvo, calculo)
         dump_debug(driver, alvo.linha, 'apos_abrir_boleto')
 
-        caminho = aguardar_pdf(driver, diretorio, anteriores, alvo)
+        caminho = aguardar_pdf(driver, diretorio, anteriores, alvo, calculo=calculo)
         dump_debug(driver, alvo.linha, 'retorno_geracao')
-        return caminho
+        return EmissaoPortal(caminho, calculo)
     except Exception:
         try:
             dump_debug(driver, alvo.linha, 'erro')

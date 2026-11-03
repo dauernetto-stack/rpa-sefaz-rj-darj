@@ -66,6 +66,9 @@ class DataPagamento(unittest.TestCase):
         valores={
             'txtIcmsInformado':'100,00','txtFecpInformado':'20,00',
             'txtTotalIcms':'100,00','txtTotalFecp':'20,00','txtTotalDocs':'R$ 0,00',
+            'txtIcmsAtualizado':'100,00','txtFecpAtualizado':'20,00',
+            'txtMoraIcms':'0,00','txtMultaMoraIcms':'0,00',
+            'txtMoraFecp':'0,00','txtMultaMoraFecp':'0,00',
             'btnAlterarDataPagamento':'Alterar','txtDataPagamento':'22/10/2026',
             'txtDataVencimento':'22/10/2026','txtPeriodo':'10/2026',
             'txtJustificativa':'NF 345','slcNaturezaLista':'4','slcListaProduto':'442',
@@ -74,7 +77,9 @@ class DataPagamento(unittest.TestCase):
         alvo=types.SimpleNamespace(icms=Decimal('100.00'),fecp=Decimal('20.00'),total=Decimal('120.00'),
                                    pagamento=date(2026,10,22),vencimento=date(2026,10,22),periodo='10/2026',nota_raw='345')
         def esperar(d,w,c):
-            if not c(d): raise TimeoutError('A auditoria recusou o item valido')
+            resultado = c(d)
+            if not resultado: raise TimeoutError('A auditoria recusou o item valido')
+            return resultado
         ns={'By':types.SimpleNamespace(ID='id'),'dinheiro':dinheiro,'brl':brl,
             'esperar':esperar,'aguardar_ajax':lambda *args:None}
         exec(compile(ast.Module(body=defs,type_ignores=[]),str(BOT),'exec'),ns)
