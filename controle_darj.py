@@ -98,6 +98,11 @@ def calcular_datas(entrada, hoje, feriados):
     """D+2 corridos, limitado ao fechamento vigente."""
     from calendar import monthrange
 
+
+    if (entrada.year, entrada.month) < (hoje.year, hoje.month):
+        ultimo_dia = monthrange(entrada.year, entrada.month)[1]
+        return hoje, date(entrada.year, entrada.month, ultimo_dia)
+
     pagamento = hoje + timedelta(days=2)
     while not dia_util(pagamento, feriados):
         pagamento += timedelta(days=1)
@@ -236,7 +241,7 @@ def validar_pdf(caminho, alvo, cnpj):
     texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
     dados = extrair_dados_pdf(texto, alvo, cnpj)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
-    nome = f"{prefixo}DARJ_NF_{alvo.nota}_{dados['numero']}.pdf"
+    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota}_{dados['numero']}.pdf"
     destino = caminho.with_name(nome)
     if destino != caminho:
         if destino.exists():

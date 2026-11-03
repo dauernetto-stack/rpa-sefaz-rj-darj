@@ -45,8 +45,8 @@ class DatasEntrada(unittest.TestCase):
     def test_nota_mes_anterior_mantem_regra_do_primeiro_zip(self):
         alvo = c.preparar_alvo(12, self.registro('30.09.2026'), date(2026, 10, 27), set())
         self.assertEqual(alvo.periodo, '09/2026')
-        self.assertEqual(alvo.pagamento, date(2026, 10, 29))
-        self.assertEqual(alvo.vencimento, date(2026, 10, 27))
+        self.assertEqual(alvo.pagamento, date(2026, 10, 27))
+        self.assertEqual(alvo.vencimento, date(2026, 9, 30))
 
 
 if __name__ == '__main__':

@@ -188,7 +188,7 @@ class ControleDARJ(unittest.TestCase):
     def test_mes_anterior_preserva_vencimento_hoje(self):
         self.assertEqual(
             controle.calcular_datas(date(2026,9,30), date(2026,10,20), set()),
-            (date(2026,10,22), date(2026,10,20)))
+            (date(2026,10,20), date(2026,9,30)))
 
     def test_sexta_dois_corridos_ajusta_para_segunda(self):
         self.assertEqual(
