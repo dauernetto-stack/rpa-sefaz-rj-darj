@@ -25,30 +25,86 @@ ALIASES = {
 
 
 def resolver_colunas(cabecalhos):
+    nomes = {normalizar(h) for h in cabecalhos}
+    direto = bool(nomes & {'valor st', 'valor fcp', 'n.fiscal', 'doc miro'})
+    aliases = ALIASES
+    opcionais = ('centro', 'aliquota')
+    if direto:
+        aliases = {
+            'data': ['Data Lanc'], 'nota': ['N.Fiscal'],
+            'icms': ['Valor ST'], 'fecp': ['Valor FCP'],
+            'miro': ['Doc MIRO'], 'tipo': ['Tipo'], 'centro': ['Centro'],
+            **{c: ALIASES[c] for c in ('status', 'numero', 'vencimento', 'valor', 'link')},
+        }
+        opcionais = ()
+        if nomes & {'darj normal', 'fecp', 'total da guia de icms st', 'data entrada'}:
+            raise ValueError('Layout misturado: use o relatorio direto ou o modelo antigo em abas separadas')
     resultado = {}
-    for campo, nomes in ALIASES.items():
+    for campo, alternativas in aliases.items():
         indices = [i + 1 for i, h in enumerate(cabecalhos)
-                   if normalizar(h) in {normalizar(n) for n in nomes}]
-        if len(indices) > 1 or (not indices and campo not in ('centro', 'aliquota')):
-            raise ValueError(f'Coluna obrigatoria ausente ou ambigua: {nomes[0]}')
+                   if normalizar(h) in {normalizar(n) for n in alternativas}]
+        if len(indices) > 1 or (not indices and campo not in opcionais):
+            raise ValueError(f'Coluna obrigatoria ausente ou ambigua: {alternativas[0]}')
         if indices:
             resultado[campo] = indices[0]
     return resultado
 
 
+
 def registro_da_linha(valores, colunas):
-    return {campo: str(valores[col - 1]).strip() if col <= len(valores) else ''
-            for campo, col in colunas.items()}
+    registro = {campo: str(valores[col - 1]).strip() if col <= len(valores) else ''
+                for campo, col in colunas.items()}
+    if 'miro' in colunas:
+        registro['total'] = brl(dinheiro(registro['icms']) + dinheiro(registro['fecp'])) if (
+            registro['icms'] and registro['fecp']) else ''
+    return registro
+
+
+
+def localizar_cabecalho(valores, linha_preferida=2):
+    candidatos = []
+    erros = []
+    for linha in sorted({1, 2, linha_preferida}):
+        if linha < 1 or linha > len(valores):
+            continue
+        try:
+            resolver_colunas(valores[linha - 1])
+        except ValueError as exc:
+            erros.append(str(exc))
+        else:
+            candidatos.append(linha)
+    if len(candidatos) == 1:
+        return candidatos[0]
+    if candidatos:
+        raise ValueError('Mais de uma linha de cabecalho reconhecida; conferir a aba')
+    raise ValueError('Cabecalho nao reconhecido nas linhas 1/2: ' + '; '.join(erros))
+
+
+def conferir_documentos_miro(registros):
+    chaves = []
+    for linha, registro in registros:
+        miro = registro.get('miro', '')
+        if not miro or not re.fullmatch(r'\d+', miro):
+            continue
+        try:
+            ano = parse_data(registro['data']).year
+        except ValueError:
+            continue
+        chaves.append((linha, (int(miro), ano), registro['status']))
+    repetidos = Counter(chave for _, chave, _ in chaves)
+    for linha, chave, status in chaves:
+        if repetidos[chave] > 1 and normalizar(status) in ('', 'processando'):
+            raise RuntimeError(f'Linha {linha}: Doc MIRO repetido no ano {chave[1]}; conferir sem emitir')
 
 
 def ler_registros(valores, linha_cabecalho=2):
-    if len(valores) < linha_cabecalho:
-        raise ValueError('Planilha sem a linha de cabecalhos esperada')
+    linha_cabecalho = localizar_cabecalho(valores, linha_cabecalho)
     colunas = resolver_colunas(valores[linha_cabecalho - 1])
     registros = [(linha, registro_da_linha(v, colunas))
                  for linha, v in enumerate(valores[linha_cabecalho:], linha_cabecalho + 1)
                  if any(str(c).strip() for c in v)]
     return colunas, registros
+
 
 
 def dinheiro(valor):
@@ -153,6 +209,13 @@ class Alvo:
 
 
 def preparar_alvo(linha, registro, hoje, feriados):
+    if 'miro' in registro:
+        if not re.fullmatch(r'\d+', registro['miro']) or int(registro['miro']) <= 0:
+            raise ValueError(f'Linha {linha}: Doc MIRO ausente ou invalido')
+        if normalizar(registro['tipo']) != 'compra':
+            raise ValueError(f'Linha {linha}: Tipo diferente de compra; conferir documento antes de emitir')
+        if not registro.get('centro', ''):
+            raise ValueError(f'Linha {linha}: Centro ausente no relatorio direto')
     nota_raw = registro['nota']
     if not re.fullmatch(r'\d+(?:-\d+)?', nota_raw):
         raise ValueError(f'Linha {linha}: nota fiscal ausente ou fora do formato numero-serie')
@@ -315,7 +378,8 @@ def validar_pdf(caminho, alvo, cnpj, calculo=None):
     texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
     dados = extrair_dados_pdf(texto, alvo, cnpj, calculo)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
-    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota_raw}.pdf"
+    marcador = '' if 'miro' in alvo.origem else 'CE12_'
+    nome = f"{prefixo}{marcador}DARJ_NF_{alvo.nota_raw}.pdf"
     destino = caminho.with_name(nome)
     if destino != caminho:
         if destino.exists():
@@ -326,6 +390,8 @@ def validar_pdf(caminho, alvo, cnpj, calculo=None):
 
 def tipo_linha_estrutural(registro):
     """Distingue modelos zerados e o rodapé Total de uma nota incompleta."""
+    if registro.get('miro') or registro.get('tipo'):
+        return None
     if registro['data'] or registro['status'] or any(
         registro[campo] for campo in ('numero', 'vencimento', 'valor', 'link')
     ):
@@ -349,7 +415,7 @@ class BlocoNF:
     subtotal: object = None
 
 
-CAMPOS_ENTRADA = ('data', 'nota', 'centro', 'aliquota', 'icms', 'fecp', 'total')
+CAMPOS_ENTRADA = ('data', 'nota', 'centro', 'aliquota', 'icms', 'fecp', 'total', 'miro', 'tipo')
 CAMPOS_RESULTADO = ('numero', 'vencimento', 'valor', 'link')
 
 
@@ -423,6 +489,8 @@ def preparar_grupo(bloco, hoje, feriados):
     componentes = []
     aliquotas = set()
     primeira = bloco.linhas[0][1]
+    if 'miro' in primeira and len(bloco.linhas) != 1:
+        raise RuntimeError('NF repetida no relatorio direto: cada linha deve conter uma NF consolidada; conferir sem somar automaticamente')
     for linha, original in bloco.linhas:
         registro = dict(original)
         if not registro['data']:
@@ -453,6 +521,8 @@ def preparar_grupo(bloco, hoje, feriados):
 
 def planejar_lote(valores, hoje, feriados, linha_cabecalho):
     colunas, registros = ler_registros(valores, linha_cabecalho)
+    if 'miro' in colunas:
+        conferir_documentos_miro(registros)
     blocos, estruturais = separar_blocos(registros)
     contagem = Counter(chave_bloco(b) for b in blocos)
     pendentes, x_incompletos = [], 0
@@ -491,6 +561,7 @@ def endereco_celula(linha, coluna):
 
 def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
                   apenas_validar=False, intervalo=5, linha_cabecalho=2):
+    linha_cabecalho = localizar_cabecalho(valores, linha_cabecalho)
     colunas, pendentes, resultado = planejar_lote(valores, hoje, feriados, linha_cabecalho)
     print(f'Lote: {len(pendentes)} guias pendentes validadas, {resultado["linhas_validadas"]} linhas; '
           f'{resultado["ignoradas"]} linhas ignoradas, {resultado["subtotais_conferidos"]} subtotais conferidos.')
@@ -507,6 +578,8 @@ def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
         atuais_colunas, registros = ler_registros(atuais, linha_cabecalho)
         if atuais_colunas != colunas:
             raise RuntimeError('Cabecalhos foram alterados durante o lote')
+        if 'miro' in colunas:
+            conferir_documentos_miro(registros)
         blocos, _ = separar_blocos(registros)
         candidatos = [b for b in blocos if b.linhas[0][0] == alvo.linha]
         if len(candidatos) != 1:

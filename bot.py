@@ -27,7 +27,7 @@ from controle_darj import brl, dinheiro, executar_lote, extrair_dados_pdf, resol
 
 ID_PLANILHA = os.getenv('ID_PLANILHA', '1U0HgRTfVIoGo3Jrr9-62ItBZumgJP77QH4SGa_lZ9jI')
 ID_PASTA_DRIVE = os.getenv('ID_PASTA_DRIVE', '1UApSGUMncRgU15q7UH1MGT6EKrEskYim')
-ABA_CONTROLE = os.getenv('ABA_CONTROLE', 'Página1')
+ABA_CONTROLE = os.getenv('ABA_CONTROLE', 'Entrada RJ')
 LINHA_CABECALHO = 2
 CNPJ_RESPONSAVEL = '58248352001201'
 URL_PORTAL = 'https://www1.fazenda.rj.gov.br/portaldepagamentos/'
@@ -493,18 +493,18 @@ def emitir_portal(alvo, antes_envio):
 
 
 def selecionar_aba(pasta):
-    candidatas = []
+    from controle_darj import localizar_cabecalho
     for aba in pasta.worksheets():
-        try:
-            resolver_colunas(aba.row_values(LINHA_CABECALHO))
-        except ValueError:
+        if aba.title != ABA_CONTROLE:
             continue
-        if aba.title == ABA_CONTROLE:
-            return aba
-        candidatas.append(aba)
-    if len(candidatas) == 1:
-        return candidatas[0]
-    raise RuntimeError(f'Aba {ABA_CONTROLE!r} nao identificada de forma unica pelos cabecalhos')
+        try:
+            localizar_cabecalho([aba.row_values(1), aba.row_values(2)], LINHA_CABECALHO)
+        except ValueError as exc:
+            raise RuntimeError(f'Aba {ABA_CONTROLE!r}: cabecalhos invalidos; conferir sem emitir') from exc
+        return aba
+    raise RuntimeError(f'Aba {ABA_CONTROLE!r} nao encontrada; configure ABA_CONTROLE antes de emitir')
+
+
 
 
 @contextmanager

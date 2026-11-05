@@ -681,7 +681,7 @@ FUNCOES = {
     texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
     dados = extrair_dados_pdf(texto, alvo, cnpj)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
-    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota}.pdf"
+    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota_raw}.pdf"
     destino = caminho.with_name(nome)
     if destino != caminho:
         if destino.exists():
@@ -700,7 +700,7 @@ FUNCOES = {
     texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
     dados = extrair_dados_pdf(texto, alvo, cnpj, calculo)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
-    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota}.pdf"
+    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota_raw}.pdf"
     destino = caminho.with_name(nome)
     if destino != caminho:
         if destino.exists():
@@ -721,7 +721,7 @@ FUNCOES = {
     texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
     dados = extrair_dados_pdf(texto, alvo, cnpj, calculo)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
-    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota}.pdf"
+    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota_raw}.pdf"
     destino = caminho.with_name(nome)
     if destino != caminho:
         if destino.exists():
@@ -741,7 +741,7 @@ FUNCOES = {
     texto = '\n'.join(p.extract_text(extraction_mode='layout') or '' for p in leitor.pages)
     dados = extrair_dados_pdf(texto, alvo, cnpj)
     prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
-    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota}.pdf"
+    nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota_raw}.pdf"
     destino = caminho.with_name(nome)
     if destino != caminho:
         if destino.exists():
