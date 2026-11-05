@@ -1,6 +1,6 @@
 # Documentação funcional e técnica — RPA DARJ-RJ
 
-Referência: código do ZIP revisado em **03/11/2026**. Para instalação e operação rápida, consulte [README.md](README.md).
+Referência: código do ZIP revisado em **05/11/2026**. Para instalação e operação rápida, consulte [README.md](README.md).
 
 ## Objetivo e responsabilidades
 
@@ -8,8 +8,8 @@ O projeto automatiza a emissão de guias DARJ para o contribuinte configurado. E
 
 | Parte | Responsabilidade |
 |---|---|
-| Operador | Informar notas reais, conferir cálculos da planilha, identificar duplicidades e investigar emissões incertas |
-| Google Sheets | Guardar entradas, principais, alíquotas, subtotais, status e resultados |
+| Operador | Importar notas reais consolidadas, conferir ST/FCP, histórico e duplicidades e investigar emissões incertas |
+| Google Sheets | Guardar relatório de origem, principais, status e resultados; o modelo antigo mantém alíquotas/subtotais |
 | Apps Script | Criar o menu e pedir ao GitHub que inicie o workflow |
 | GitHub Actions | Preparar a execução no runner, executar testes/validação/emissão e preservar artefatos |
 | Python/Selenium | Preencher o portal, conferir as respostas e obter o PDF |
@@ -63,61 +63,74 @@ Nenhum passo do workflow executa o aplicador. Não é preciso mantê-lo como dep
 
 ## Entradas da planilha
 
-A seleção prefere `ABA_CONTROLE` quando a aba possui os cabeçalhos válidos. Caso contrário, aceita uma única aba com o esquema reconhecido; se houver ambiguidade, para. O cabeçalho é lido na linha 2.
+O padrão é a aba **Entrada RJ**, definida por `ABA_CONTROLE`. A seleção exige essa aba e cabeçalhos válidos. Se a aba estiver ausente ou inválida, para sem buscar uma alternativa. Para usar outra aba, configure ABA_CONTROLE explicitamente.
 
-Os campos obrigatórios são `Data entrada`, `Nº Nota Fiscal`, `DARJ Normal`, `FECP`, `TOTAL DA GUIA DE ICMS ST`, `PROC DARJ`, `Nº DARJ`, `Vcto DARJ`, `Valor DARJ` e `Link DARJ`. O código aceita aliases definidos em `ALIASES`, normalizando acentos e maiúsculas/minúsculas. Cabeçalho obrigatório ausente ou duplicado bloqueia.
+`localizar_cabecalho()` confere as linhas 1, 2 e a linha preferida recebida. No bot atual a referência LINHA_CABECALHO é 2, portanto a seleção reconhece as linhas 1/2. Se ambas parecerem cabeçalhos, há bloqueio por ambiguidade. Os números reais das linhas são preservados nas atualizações.
 
-`Centro` e `ALQ ICMS` são opcionais no esquema; uma NF com várias parcelas exige alíquota preenchida em cada parcela. A série da NF é preservada: `650874-7` e `650874-8` são notas diferentes.
+`resolver_colunas()` detecta o relatório direto pela presença dos nomes Valor ST, Valor FCP, N.Fiscal ou Doc MIRO e então exige o esquema completo abaixo. Cabeçalhos ausentes/duplicados e mistura com o modelo antigo bloqueiam. A comparação normaliza acentos e caixa, mas não adivinha nomes abreviados diferentes.
 
-A leitura usa os valores **formatados** do Sheets. Datas aceitas: `DD.MM.AAAA`, `DD/MM/AAAA` e `AAAA-MM-DD`. Pendências com data futura ou ano menor que 1900 são rejeitadas. Não se corrige automaticamente um ano digitado como `0206`.
+### Relatório direto: esquema de entrada
 
-### Cálculos da planilha e principal
+| Campo interno | Cabeçalho de origem | Tratamento |
+|---|---|---|
+| miro | Doc MIRO | Número positivo; identidade normalizada para detectar duplicidade |
+| tipo | Tipo | Deve ser compra; outros tipos param para conferência |
+| nota | N.Fiscal | NF e série, preservadas no portal/PDF |
+| data | Data Lanc | Entrada, período e referência para as regras de vencimento |
+| centro | Centro | Obrigatório; participa da identidade da NF e do prefixo do arquivo |
+| icms | Valor ST | Principal de ICMS, sem incluir FCP |
+| fecp | Valor FCP | Principal de FECP |
+| total | Sem coluna de origem | Calculado pelo Python: ST + FCP |
 
-O código **não calcula base de ST, MVA, IPI ou alíquota tributária da nota**. Ele recebe os valores calculados pela planilha:
+Os cinco cabeçalhos de resultado são obrigatórios: PROC DARJ, Nº DARJ, Vcto DARJ, Valor DARJ e Link DARJ. Na disposição dos anexos, as 18 colunas de origem ficam em A:R e as cinco de resultado em S:W. O backend localiza todas por nome, permitindo reordenar colunas.
+
+As demais colunas — Data Fatur, Fornecedor, Nome, Região, Montante, Nº pedido, Texto, Usuário, Doc Contab, Doc Materi e FUNEF — são metadados e não alteram o principal nem as datas usadas na guia. O Python não deriva ST a partir de Montante nem da nota bruta. O CNPJ do contribuinte continua fixo no bot, independente do Centro/Fornecedor.
+
+Datas aceitas: DD.MM.AAAA, DD/MM/AAAA e AAAA-MM-DD. Data Lanc futura ou ano menor que 1900 bloqueiam pendências. A data de faturamento não substitui uma Data Lanc ausente/inválida.
+
+### Cálculo do principal sem fórmulas
 
 ```text
-principal ICMS = DARJ Normal
-principal FECP = FECP
-principal total = principal ICMS + principal FECP
+principal ICMS = Valor ST
+principal FECP = Valor FCP
+principal total = Valor ST + Valor FCP
 ```
 
-O total precisa coincidir exatamente com a coluna `TOTAL DA GUIA DE ICMS ST`. `VALOR Z3125`, `Diferença`, bases e valores da nota não substituem esse total e não são usados como tolerância.
+Exemplo confirmado: ST 173,35 e FCP 20,07 geram principal 193,42. Com Data Fatur 28/10/2026 e Data Lanc 03/11/2026, a referência é **11/2026**.
 
-Na planilha utilizada no projeto, exemplos de fórmulas de arredondamento são:
+Outros exemplos dos anexos: 2.809,82 + 245,72 = 3.055,54 e 1.417,24 + 128,14 = 1.545,38.
 
-```excel
-J97: =ARRED((H97*20%)-F97;2)
-K97: =ARRED(H97*2%;2)
-L97: =J97+K97
-```
+O parser dinheiro() usa Decimal. Valores precisam ser finitos, não negativos e válidos em centavos; o total deve ser positivo. FCP zero é permitido, mas precisa vir preenchido. Campo vazio, erro de fórmula ou fração de centavo não viram zero. O código não arredonda silenciosamente nem aplica tolerância para aceitar divergências.
 
-Esses são exemplos do modelo operacional, não percentuais definidos ou verificados pelo Python. A regra tributária e as fórmulas de origem precisam ser conferidas pelo responsável. Em um modelo com colunas diferentes, adapte as referências.
+Vlr Produtos, IPI, ICMS Normal, ALQ ICMS, BC da ST e ST calculado do modelo antigo não são necessários no relatório direto. Não há cálculo de MVA/base/percentuais fiscais pelo backend. O script separado de correção de arredondamento do modelo antigo também não é requisito da aba nova.
 
-Formatação com duas casas não arredonda o valor armazenado. As parcelas devem ser arredondadas antes da soma; o subtotal deve somar essas parcelas. Por exemplo, a soma de `179,25 + 354,88` é `534,13`, mesmo que a soma de fórmulas com casas ocultas exibisse `534,14`.
+### NF consolidada e proteção por Doc MIRO
 
-O parser `dinheiro()` usa `Decimal`, exige valores finitos, não negativos e com centavos exatos. Não converte erros, campos vazios ou textos inválidos em zero. Nenhuma tolerância monetária é aplicada às validações.
+No relatório direto, cada linha deve representar uma NF consolidada. O backend não soma duas ocorrências da mesma NF sem informação de alíquota: bloqueia para conferência, mesmo que tenham documentos MIRO diferentes.
 
-### Agrupamento por NF
+A identidade de NF considera número/série, Centro e período. Séries diferentes são notas distintas; zeros à esquerda são normalizados para detectar duplicidades, mantendo o texto original no documento.
 
-Um grupo reúne linhas fisicamente consecutivas com mesma identidade de NF/série e mesmo Centro. Zeros à esquerda são normalizados na identidade para detectar duplicidades; o texto original da NF continua sendo usado no portal e no PDF.
+`conferir_documentos_miro()` compara Doc MIRO normalizado e ano da Data Lanc. Uma ocorrência repetida envolvendo pendência ou PROCESSANDO bloqueia; a conferência ocorre no planejamento e nas releituras. Isso evita que um mesmo documento seja importado sob NFs diferentes e que uma duplicidade inserida durante a execução passe despercebida.
 
-Regras:
+O retrato de entrada inclui Data Lanc, NF, Centro, principais, total derivado, Doc MIRO e Tipo. Mudanças nesses dados durante o processamento interrompem a execução. Outros metadados não participam dessa comparação.
 
-1. A primeira parcela precisa de data. Uma continuação vazia herda a primeira data.
-2. Datas preenchidas no grupo precisam coincidir.
-3. Em grupos com várias linhas, as alíquotas precisam ser informadas e diferentes entre si. `4%`, `4` e `0,04` representam a mesma alíquota para essa conferência.
-4. Somam-se os principais de ICMS e FECP de todas as parcelas.
-5. `SOMA VALORES`, quando presente, precisa vir imediatamente depois do grupo e coincidir com ICMS, FECP e total somados. Não pode conter data, status ou dados de guia.
-6. NF/Centro/período em blocos separados bloqueia as pendências afetadas. Não se somam automaticamente ocorrências distantes.
-7. Grupo parcialmente marcado bloqueia; grupo inteiramente marcado é ignorado. Dados de guia com status vazio bloqueiam.
+### Compatibilidade com o modelo antigo
 
-Exemplo: duas parcelas de ICMS `338,81` e `1.508,68`, com FECP `37,14` e `215,19`, produzem principal de **R$ 2.099,82**, em uma guia.
+O modo antigo continua aceitando Data entrada, Nº Nota Fiscal, DARJ Normal, FECP e TOTAL DA GUIA DE ICMS ST, junto aos cinco campos de resultado. Nele, Centro é opcional e ALQ ICMS precisa existir nas parcelas agrupadas.
 
-Modelos sem identificação e com valores vazios/zerados e linhas de rodapé `Total` reconhecidas são ignorados. Um registro com identificação/valores positivos incompletos não é descartado silenciosamente como modelo.
+Somente nesse modo, linhas consecutivas da mesma NF/Centro com alíquotas diferentes são somadas para emitir uma guia. Continuação com data vazia herda a primeira; datas explícitas precisam coincidir. SOMA VALORES, quando presente, precisa coincidir com os principais somados e não é contado novamente. Alíquota repetida, grupo parcialmente marcado ou NF em blocos separados bloqueiam.
+
+No modelo antigo as fórmulas precisam produzir centavos consistentes; formatar duas casas não arredonda o valor armazenado. O total da linha é conferido contra DARJ Normal + FECP. Não misture os dois esquemas na mesma aba.
+
+### Migração e histórico
+
+O código lê e controla a aba selecionada, sem cruzar automaticamente guias de abas históricas. Antes de importar o relatório com status vazio, confira se as NFs já foram emitidas no modelo antigo. Preserve os status e resultados reais dessas guias na nova aba ou importe somente pendências verificadas. Não copie linhas emitidas como novas pendências.
+
+A mudança de Data entrada para Data Lanc também pode mudar o mês de referência: confira esse efeito ao migrar registros antigos. O sistema não faz migração automática do histórico.
 
 ## Regras de datas
 
-`hoje` é calculado no fuso `America/Sao_Paulo`. A data da entrada determina o período de referência, independentemente do mês da execução. Não há filtro obrigatório por D-1.
+`hoje` é calculado no fuso `America/Sao_Paulo`. No relatório direto, **Data Lanc** determina a entrada e o período de referência, independentemente da Data Fatur e do mês da execução. No modelo antigo a origem é Data entrada. Não há filtro obrigatório por D-1.
 
 ### Mês da entrada já encerrado
 
@@ -143,6 +156,10 @@ Exemplo: entrada `28/10/2026`, execução `29/10/2026`: D+2 ajustado chegaria a 
 O código mantém uma exceção explícita: quando o último dia útil calculado já é anterior a `hoje`, o vencimento fica em `hoje`, enquanto o pagamento permanece D+2 ajustado. Exemplo de execução em `31/10/2026`: vencimento `31/10` e pagamento `03/11`, considerando o feriado configurado de `02/11`.
 
 Esse caso pode produzir encargos, que seguem a mesma auditoria. Ele é diferente de uma execução já em novembro, tratada pelo primeiro ramo.
+
+### Exemplo do relatório direto
+
+Para Data Lanc 03/11/2026, executando em 05/11/2026: a referência é 11/2026; D+2 cai no sábado 07/11 e avança para segunda 09/11. Pagamento e vencimento ficam em 09/11, conforme o calendário configurado. D+2 parte da execução, não da Data Lanc.
 
 ### Calendário
 
@@ -187,15 +204,17 @@ Nunca se escolhe o total esperado a partir do próprio PDF: ele deve coincidir c
 | Função | Responsabilidade |
 |---|---|
 | `normalizar` | Remove acentos e diferenças de caixa para comparar textos |
-| `resolver_colunas` | Resolve cabeçalhos e aliases; rejeita ausência/duplicidade |
-| `registro_da_linha` | Converte uma linha em campos identificados pelos cabeçalhos |
+| `resolver_colunas` | Distingue relatório direto/modelo antigo; rejeita mistura, ausência e duplicidade de cabeçalhos |
+| `registro_da_linha` | Converte a linha e calcula ST + FCP em Decimal no relatório direto |
+| `localizar_cabecalho` | Localiza o cabeçalho válido e rejeita ambiguidade |
+| `conferir_documentos_miro` | Bloqueia Doc MIRO duplicado no ano da Data Lanc envolvendo pendência/PROCESSANDO |
 | `ler_registros` | Preserva os números reais das linhas e monta os registros |
 | `dinheiro` | Converte e valida moeda em `Decimal` |
 | `brl` | Formata valor com vírgula e duas casas para campos/logs |
 | `parse_data` | Interpreta os formatos de data aceitos |
 | `dia_util` | Confere fim de semana e conjunto de feriados recebido |
 | `calcular_datas` | Aplica D+2, fechamento e mês encerrado |
-| `preparar_alvo` | Valida NF, dinheiro e entrada; monta principais e datas |
+| `preparar_alvo` | Valida NF, dinheiro e entrada; no modo direto também exige MIRO, compra e Centro |
 | `conferir_calculo_portal` | Lê os campos monetários observados e valida sua composição |
 | `total_esperado` | Retorna o total final auditado ou o principal no contrato legado |
 | `extrair_dados_pdf` | Confere identidade, número, datas e total extraídos do documento |
@@ -205,7 +224,7 @@ Nunca se escolhe o total esperado a partir do próprio PDF: ele deve coincidir c
 | `separar_blocos` | Forma grupos consecutivos e associa subtotais |
 | `chave_bloco` | Identifica NF/série, Centro e período para detectar blocos repetidos |
 | `ler_aliquota` | Normaliza a alíquota para distinguir parcelas |
-| `preparar_grupo` | Valida parcelas, datas e subtotal e soma os principais |
+| `preparar_grupo` | No modelo antigo valida/soma parcelas; no direto exige uma linha de NF consolidada |
 | `planejar_lote` | Valida a seleção inteira antes de iniciar emissões |
 | `endereco_celula` | Converte número de coluna/linha em endereço como `O97` |
 | `executar_lote` | Reserva grupos, chama emissão, valida PDF, envia e confirma resultados/status |
@@ -233,7 +252,7 @@ Classes auxiliares: `BlocoNF` representa as parcelas e o subtotal; `Alvo` é a e
 | `abrir_darj_emitido` | Confere tela de emissão, CNPJ, quantidade e total e abre o boleto existente |
 | `aguardar_pdf` | Aguarda download estável ou valida HTML imprimível antes de gerar PDF local |
 | `emitir_portal` | Coordena uma tentativa única por grupo e retorna arquivo com o cálculo auditado |
-| `selecionar_aba` | Escolhe a aba configurada ou uma única candidata válida |
+| `selecionar_aba` | Exige a aba configurada, com cabeçalho válido; não usa outra aba como fallback |
 | `exclusao_local` | Impede dois processos simultâneos na mesma pasta |
 | `main` | Lê argumentos/configurações, inicializa Google/calendário e chama o lote |
 
@@ -257,17 +276,21 @@ A validação exige:
 
 O código não faz OCR, não verifica autenticidade por assinatura digital e não recalcula o dígito verificador do código de barras. A conferência do PDF usa texto extraído e os campos definidos no parser.
 
-O nome atual é:
+O código atual distingue o layout no nome:
 
 ```python
-nome = f"{prefixo}CE12_DARJ_NF_{alvo.nota_raw}.pdf"
+prefixo = re.sub(r'[^\w-]', '_', alvo.centro) + '_' if alvo.centro else ''
+marcador = '' if 'miro' in alvo.origem else 'CE12_'
+nome = f"{prefixo}{marcador}DARJ_NF_{alvo.nota_raw}.pdf"
 ```
 
-`nota_raw` mantém a série. `prefixo` é o Centro sanitizado seguido de `_`, quando preenchido. `CE12_` é fixo: com Centro `RJ01`, o resultado começa em `RJ01_CE12_`; sem Centro, começa em `CE12_`. O número do DARJ fica na planilha, não no nome. Se já existir outro arquivo com o nome final na pasta local, o código bloqueia em vez de sobrescrevê-lo.
+No relatório direto, Centro CE12 e NF 652063-7 produzem **CE12_DARJ_NF_652063-7.pdf**, sem duplicar CE12. No modelo antigo, o marcador CE12_ fixo é preservado após o prefixo opcional. A série permanece em ambos; o número do DARJ fica na planilha, não no nome.
+
+Se outro arquivo já existir com o nome final na pasta local, há bloqueio em vez de sobrescrita. Os downloads são separados por tentativa, mas isso não deve ser usado como autorização para reemitir a mesma guia.
 
 Depois da validação, o upload cria um arquivo na pasta configurada com `supportsAllDrives=True`. Só após receber ID válido o controle grava resultados, verifica a fórmula/destino de `Link PDF` e marca `X`. Nenhuma permissão pública é criada pelo upload.
 
-Em grupos com parcelas, número, vencimento, total final, link e status são repetidos em todas as parcelas. Para relatórios, deduplique por guia: somar `Valor DARJ` de todas as parcelas duplicaria valores. O subtotal permanece como entrada conferida e não recebe esses resultados.
+**Somente no modelo antigo**, grupos com parcelas repetem número, vencimento, total final, link e status em todas as parcelas. No relatório direto há uma linha por NF. Para relatórios, deduplique por guia: somar `Valor DARJ` de todas as parcelas duplicaria valores. O subtotal permanece como entrada conferida e não recebe esses resultados.
 
 ## Status, concorrência e recuperação
 
@@ -275,7 +298,7 @@ O grupo é reservado como `PROCESSANDO` antes de abrir o portal. Após a confirm
 
 O marcador de envio é conservador: `REVISAR` não prova que a guia existe, mas exige conferir essa possibilidade. Antes de alterar status após uma falha, o controle tenta confirmar que a linha ainda pertence à mesma NF/Centro.
 
-O programa relê a planilha para detectar mudanças de cabeçalhos, entradas, linhas do grupo, subtotal, ocorrências duplicadas, status e resultados. O número da guia é escrito como texto via `RAW`; o link é escrito como fórmula via `USER_ENTERED` e conferido pelo destino, não só pelo rótulo.
+O programa relê a planilha para detectar mudanças de cabeçalhos, entradas, Doc MIRO/Tipo no modo direto, linhas do grupo, subtotal no modo antigo, ocorrências duplicadas, status e resultados. O número da guia é escrito como texto via `RAW`; o link é escrito como fórmula via `USER_ENTERED` e conferido pelo destino, não só pelo rótulo.
 
 A concorrência do workflow e o arquivo `.darj-rj.lock` evitam sobreposição no mesmo contexto. Não são um bloqueio distribuído de todas as máquinas que possam acessar a planilha.
 
@@ -291,6 +314,10 @@ A concorrência do workflow e o arquivo `.darj-rj.lock` evitam sobreposição no
 | Erro | Interpretação/ação |
 |---|---|
 | Soma da linha/subtotal divergente | Conferir principais e arredondamento; não aumentar o principal para absorver multa |
+| Doc MIRO repetido | Conferir o relatório e as guias já emitidas; não trocar o identificador para liberar |
+| NF repetida no relatório direto | Conferir consolidação/duplicidade; não somar automaticamente cópias |
+| Layout misturado | Separar relatório direto e modelo antigo em abas distintas |
+| Aba ausente/inválida | Conferir ABA_CONTROLE, nome da aba e cabeçalhos nas linhas 1/2 |
 | NF em blocos separados | Conferir duplicidade ou parcelas legítimas; não remover a proteção nem somar cópias da mesma parcela |
 | Auditoria bloqueada | Ler os campos observados: principal, atualizado, mora, multa, totais e datas |
 | Principal atualizado diferente | Correção monetária fora do tratamento automático atual; conferir manualmente |
@@ -307,7 +334,7 @@ A concorrência do workflow e o arquivo `.darj-rj.lock` evitam sobreposição no
 
 ### darj-rj.yml
 
-O fluxo principal é manual (`workflow_dispatch`), sem input de linha. O bloco `schedule` está comentado. Não basta o job ficar verde: confira se a etapa de emissão realmente executou e se havia pendências.
+O fluxo principal é manual (`workflow_dispatch`), sem input de linha. O bloco `schedule` está comentado. As linhas `# if: ...` junto dos passos de validação/emissão são comentários, portanto a emissão está habilitada após as etapas anteriores passarem. Não basta o job ficar verde: confira se a etapa de emissão realmente executou e se havia pendências.
 
 Sequência: checkout com `clean: false` e credencial Git não persistida; instalação de dependências; verificação do Chrome/limpeza restrita do cache antigo; testes Python; recuperação da chave Google; `--validar`; emissão; upload de artefatos e remoção da chave temporária.
 
@@ -331,7 +358,7 @@ HTTP 200/204 é aceito pelo script como solicitação bem-sucedida. Há mensagen
 
 ## Testes e manutenção
 
-Na revisão local do ZIP, passaram **116 testes Python e nove cenários do Apps Script**. Todos usam simulações locais; isso não certifica disponibilidade contínua do portal nem permissões atuais do Google/GitHub.
+Na revisão local do ZIP, passaram **148 testes Python e nove cenários do Apps Script**. Todos usam simulações locais; isso não certifica disponibilidade contínua do portal nem permissões atuais do Google/GitHub.
 
 | Arquivo de teste | Cobertura principal |
 |---|---|
@@ -344,6 +371,7 @@ Na revisão local do ZIP, passaram **116 testes Python e nove cenários do Apps 
 | `test_portal.py` | Confirmação de pagamento e auditoria do item atual |
 | `test_encargos.py` | Principal/encargos, composição exata, PDF, upload e gravação do total final |
 | `test_fluxo_encargos.py` | Propagação do cálculo, tentativa única e impressão de HTML validado |
+| `test_relatorio_direto.py` | ST/FCP, Data Lanc, cabeçalho 1/2, MIRO, duplicidades, escrita em S:W, seleção obrigatória da aba e integração simulada |
 | `test_appscript.cjs` | Menu/dispatch e respostas simuladas do GitHub |
 
 Dependências fixadas: Selenium `4.51.0`, gspread `6.2.1`, oauth2client `4.1.3`, google-api-python-client `2.201.0`, webdriver-manager `4.1.2`, holidays `0.107` e pypdf `6.10.0`. O Node é usado nos testes do `.gs`, não pelo fluxo Python de emissão.
@@ -351,3 +379,23 @@ Dependências fixadas: Selenium `4.51.0`, gspread `6.2.1`, oauth2client `4.1.3`,
 Antes de publicar mudanças, rode compilação, testes Python e, quando alterar o `.gs`, os testes Node. Revise o diff. Para validar a planilha real sem emitir, use `python bot.py --validar`; não use `python bot.py` como teste de sintaxe.
 
 O aplicador é temporário. O código ativo já deve conter as alterações após sua execução; não o rode como etapa permanente do workflow. A pasta de backup do ZIP contém versões antigas que podem servir à conferência, mas não devem ser confundidas com o código atual.
+
+## O que mudou em relação à revisão anterior
+
+A entrada passou do modelo com fórmulas para o relatório direto. O total é derivado no registro; as regras de datas recebem Data Lanc. O planejamento e as releituras passaram a conferir Doc MIRO/Tipo. O novo layout exige NF consolidada e não reutiliza a lógica de agrupar alíquotas sem a informação correspondente. O modelo antigo continua compatível quando configurado explicitamente.
+
+bot.py usa Entrada RJ como padrão e não busca outra aba se essa estiver incorreta. O nome do PDF vem do Centro no relatório direto. AppsScript_RJ.gs, requirements.txt e .gitignore são iguais aos da revisão anterior comparada. O workflow recebeu comentários de teste, sem mudar a execução efetiva.
+
+## Arquivos que podem ser retirados
+
+- `.backup_encargos_20261103_151621_b45cb0/`: backup anterior à atualização; pode sair do projeto após guardar uma cópia de segurança e conferir o código atual no Git. Não remova as cópias da raiz junto com ele.
+- `aplicar_encargos_v3.py`: aplicador temporário; o robô não o importa e o workflow não o chama. Pode ser retirado após atualização concluída.
+- `testar_acesso.py`: diagnóstico auxiliar opcional, fora do workflow principal. Removê-lo perde essa conveniência, não o fluxo de emissão.
+- `.github/workflows/diagnosticar-espaco-rj.yml`: opcional; perde somente o diagnóstico manual de disco. Não remova a pasta .github inteira.
+- `credenciais.example.json`: exemplo opcional, útil para novas instalações. Não é a chave real.
+
+Mantenha AppsScript_RJ.gs como fonte do menu e os testes para manutenção. Apagar o .gs do repositório não remove o código já instalado no Google; apagar o código do Apps Script ou seus gatilhos no Google afeta o menu. O fluxo GitHub/Python não depende de executar o .gs localmente.
+
+Mantenha bot.py, controle_darj.py, requirements.txt, .gitignore, workflow principal, tests/, README.md e DOC.md. O workflow executa os testes Python; apagar a pasta tests compromete a validação do processo mesmo que a emissão pudesse ser chamada manualmente.
+
+Essas orientações classificam os arquivos. Nenhuma exclusão foi realizada nesta revisão.
