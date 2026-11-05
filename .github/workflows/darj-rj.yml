@@ -96,10 +96,11 @@ jobs:
           PY
 
       - name: Conferir a planilha antes de emitir
+        # if: ${{ false }} -- Teste de leitura 
         run: python3 bot.py --validar
 
       - name: Executar o lote de pendentes
-        if: ${{ false }}
+        # if: ${{ false }} - Teste  sem emissão
         run: python3 bot.py
 
       - name: Preservar diagnosticos e PDFs para conferencia
