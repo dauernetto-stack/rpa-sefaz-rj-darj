@@ -210,12 +210,27 @@ class Alvo:
 
 def preparar_alvo(linha, registro, hoje, feriados):
     if 'miro' in registro:
-        if not re.fullmatch(r'\d+', registro['miro']) or int(registro['miro']) <= 0:
-            raise ValueError(f'Linha {linha}: Doc MIRO ausente ou invalido')
-        if normalizar(registro['tipo']) != 'compra':
-            raise ValueError(f'Linha {linha}: Tipo diferente de compra; conferir documento antes de emitir')
+        tipo = normalizar(registro['tipo'])
+
+        if tipo not in ('compra', 'transferencia'):
+            raise ValueError(
+                f'Linha {linha}: Tipo deve ser compra ou transferencia; '
+                'conferir antes de emitir'
+            )
+
+        miro = registro['miro']
+
+        if (tipo == 'compra' or miro) and (
+            not re.fullmatch(r'\d+', miro) or int(miro) <= 0
+        ):
+            raise ValueError(
+                f'Linha {linha}: Doc MIRO ausente ou invalido'
+            )
+
         if not registro.get('centro', ''):
-            raise ValueError(f'Linha {linha}: Centro ausente no relatorio direto')
+            raise ValueError(
+                f'Linha {linha}: Centro ausente no relatorio direto'
+            )
     nota_raw = registro['nota']
     if not re.fullmatch(r'\d+(?:-\d+)?', nota_raw):
         raise ValueError(f'Linha {linha}: nota fiscal ausente ou fora do formato numero-serie')
