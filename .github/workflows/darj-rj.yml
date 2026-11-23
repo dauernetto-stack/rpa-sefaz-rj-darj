@@ -1,7 +1,16 @@
 name: RPA DARJ-RJ - lote de pendentes
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'validar confere planilha e Drive; emitir processa pendentes'
+        type: choice
+        required: true
+        default: validar
+        options:
+          - validar
+          - emitir
   # Reativar o horario automatico somente depois de conferir o primeiro retorno real.
   # schedule:
   #   - cron: '0 11 * * 1-5'
@@ -33,6 +42,7 @@ jobs:
         run: python3 -m pip install --break-system-packages -r requirements.txt
 
       - name: Usar Chrome instalado e liberar cache antigo
+        if: inputs.modo == 'emitir'
         shell: bash
         run: |
           python3 - <<'PY'
@@ -95,12 +105,21 @@ jobs:
           os.chmod('credenciais.json', 0o600)
           PY
 
-      - name: Conferir a planilha antes de emitir
-        # if: ${{ false }} -- Teste de leitura 
-        run: python3 bot.py --validar
+      - name: Conferir a planilha e a pasta FB60
+        env:
+          FB60_DRIVE_FOLDER_ID: ${{ vars.FB60_DRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          if [ -z "$FB60_DRIVE_FOLDER_ID" ]; then
+            echo 'Configure a variavel FB60_DRIVE_FOLDER_ID no repositorio.'
+            exit 1
+          fi
+          python3 bot.py --validar
 
       - name: Executar o lote de pendentes
-        # if: ${{ false }} - Teste  sem emissão
+        if: github.event_name == 'workflow_dispatch' && inputs.modo == 'emitir'
+        env:
+          FB60_DRIVE_FOLDER_ID: ${{ vars.FB60_DRIVE_FOLDER_ID }}
         run: python3 bot.py
 
       - name: Preservar diagnosticos e PDFs para conferencia
