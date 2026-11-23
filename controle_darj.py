@@ -295,6 +295,7 @@ class CalculoPortal:
 class EmissaoPortal:
     caminho: Path
     calculo: CalculoPortal
+    data_emissao: date | None = None
 
 
 def conferir_calculo_portal(alvo, campos):
@@ -575,7 +576,7 @@ def endereco_celula(linha, coluna):
 
 
 def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
-                  apenas_validar=False, intervalo=5, linha_cabecalho=2):
+                  apenas_validar=False, intervalo=5, linha_cabecalho=2, *, publicar_fb60=None):
     linha_cabecalho = localizar_cabecalho(valores, linha_cabecalho)
     colunas, pendentes, resultado = planejar_lote(valores, hoje, feriados, linha_cabecalho)
     print(f'Lote: {len(pendentes)} guias pendentes validadas, {resultado["linhas_validadas"]} linhas; '
@@ -672,6 +673,8 @@ def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
                 for linha in reservadas
             ], value_input_option='USER_ENTERED')
             ler_atual(alvo, 'PROCESSANDO', dados, formula)
+            if publicar_fb60 is not None:
+                publicar_fb60(caminho, alvo, retorno, dados, file_id)
             planilha.batch_update([
                 {'range': endereco_celula(linha, colunas['status']), 'values': [['X']]}
                 for linha in reservadas
