@@ -451,6 +451,7 @@ def aguardar_pdf(driver, diretorio, anteriores, alvo, timeout=90, calculo=None):
 
 def emitir_portal(alvo, antes_envio):
     from controle_darj import EmissaoPortal, CalculoPortal
+    from registro_fb60 import data_emissao_local
     diretorio = BASE / 'downloads_darj' / f'linha_{alvo.linha}_{uuid.uuid4().hex[:10]}'
     diretorio.mkdir(parents=True)
     driver = None
@@ -473,11 +474,12 @@ def emitir_portal(alvo, antes_envio):
         botao.click()  # Tentativa única de geração.
 
         abrir_darj_emitido(driver, wait, alvo, calculo)
+        data_emissao = data_emissao_local()
         dump_debug(driver, alvo.linha, 'apos_abrir_boleto')
 
         caminho = aguardar_pdf(driver, diretorio, anteriores, alvo, calculo=calculo)
         dump_debug(driver, alvo.linha, 'retorno_geracao')
-        return EmissaoPortal(caminho, calculo)
+        return EmissaoPortal(caminho, calculo, data_emissao)
     except Exception:
         try:
             dump_debug(driver, alvo.linha, 'erro')
@@ -548,6 +550,17 @@ def main():
         anos = {hoje.year - 1, hoje.year, hoje.year + 1}
         feriados = holidays.Brazil(subdiv='RJ', years=sorted(anos))
         drive = build('drive', 'v3', credentials=credenciais)
+        pasta_fb60 = os.environ.get('FB60_DRIVE_FOLDER_ID', '').strip()
+        publicar_fb60 = None
+        if pasta_fb60:
+            from registro_fb60 import conferir_pasta, enviar_registro, gravar_registro, registro_rj
+            conferir_pasta(drive, pasta_fb60)
+
+            def publicar_fb60(caminho, alvo, retorno, dados, file_id):
+                registro = registro_rj(alvo, retorno, dados, file_id)
+                caminho_registro = gravar_registro(caminho.parent, registro)
+                enviar_registro(drive, pasta_fb60, caminho_registro)
+                print(f'Registro FB60 publicado: {caminho_registro.name}')
 
         def subir_pdf(caminho):
             arquivo = drive.files().create(
@@ -562,7 +575,7 @@ def main():
 
         resultado = executar_lote(valores, planilha, emitir_portal, subir_pdf, hoje, feriados,
                                    CNPJ_RESPONSAVEL, apenas_validar=args.validar,
-                                   linha_cabecalho=LINHA_CABECALHO)
+                                   linha_cabecalho=LINHA_CABECALHO, publicar_fb60=publicar_fb60)
         print(f'Lote finalizado: {resultado}')
 
 
