@@ -31,12 +31,12 @@ def resolver_colunas(cabecalhos):
     opcionais = ('centro', 'aliquota')
     if direto:
         aliases = {
-            'data': ['Data Lanc'], 'nota': ['N.Fiscal'],
+            'data': ['Data Lanc'], 'data_fatura': ['Data Fatura'], 'nota': ['N.Fiscal'],
             'icms': ['Valor ST'], 'fecp': ['Valor FCP'],
             'miro': ['Doc MIRO'], 'tipo': ['Tipo'], 'centro': ['Centro'],
             **{c: ALIASES[c] for c in ('status', 'numero', 'vencimento', 'valor', 'link')},
         }
-        opcionais = ()
+        opcionais = ('data_fatura',)
         if nomes & {'darj normal', 'fecp', 'total da guia de icms st', 'data entrada'}:
             raise ValueError('Layout misturado: use o relatorio direto ou o modelo antigo em abas separadas')
     resultado = {}
@@ -431,7 +431,7 @@ class BlocoNF:
     subtotal: object = None
 
 
-CAMPOS_ENTRADA = ('data', 'nota', 'centro', 'aliquota', 'icms', 'fecp', 'total', 'miro', 'tipo')
+CAMPOS_ENTRADA = ('data_fatura', 'data', 'nota', 'centro', 'aliquota', 'icms', 'fecp', 'total', 'miro', 'tipo')
 CAMPOS_RESULTADO = ('numero', 'vencimento', 'valor', 'link')
 
 
@@ -585,6 +585,11 @@ def executar_lote(valores, planilha, emitir, subir_pdf, hoje, feriados, cnpj,
         print(f'NF {alvo.nota_raw} | linhas {", ".join(str(n) for n, _ in alvo.origens)} | '
               f'Entrada {alvo.entrada:%d/%m/%Y} | Periodo {alvo.periodo} | '
               f'ICMS {brl(alvo.icms)} + FECP {brl(alvo.fecp)} = {brl(alvo.total)}')
+    if publicar_fb60 is not None:
+        from registro_fb60 import datas_planilha
+        for alvo in pendentes:
+            datas_planilha({'Data Fatura': alvo.origem.get('data_fatura'),
+                            'Data Lanc': alvo.origem.get('data')})
     if apenas_validar:
         return resultado
 

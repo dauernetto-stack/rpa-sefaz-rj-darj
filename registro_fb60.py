@@ -11,9 +11,27 @@ def data_emissao_local():
     return datetime.now(ZoneInfo('America/Sao_Paulo')).date()
 
 
-def registro_mg(guia, calculo, centro, nf, competencia, emissao, vencimento, pagamento, id_pdf):
+
+def datas_planilha(dados):
+    def converter(campo):
+        texto = str(dados.get(campo) or '').strip()
+        for formato in ('%d/%m/%Y', '%d.%m.%Y', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(texto, formato).date().isoformat()
+            except ValueError:
+                continue
+        raise ValueError(f'{campo} ausente ou invalida na planilha')
+    return {
+        'data_fatura': converter('Data Fatura'),
+        'data_lancamento': converter('Data Lanc'),
+        'origem_datas_fb60': 'planilha',
+    }
+
+
+def registro_mg(guia, calculo, centro, nf, competencia, emissao, vencimento, pagamento, id_pdf, *, dados_planilha=None):
     mes, ano = competencia.split('/')
     return {
+        **(datas_planilha(dados_planilha) if dados_planilha is not None else {}),
         'versao': 1, 'uf': 'MG', 'tipo_guia': 'DAE', 'numero_guia': str(guia['numDoc']).strip(),
         'nota_fiscal': nf.strip(), 'centro': centro, 'competencia': f'{ano}-{mes}',
         'data_emissao': emissao.isoformat(),
@@ -30,7 +48,11 @@ def registro_rj(alvo, retorno, guia, id_pdf):
     calculo = retorno.calculo
     mes, ano = alvo.periodo.split('/')
     validade = guia.get('validade')
+    origem = getattr(alvo, 'origem', None)
+    datas = datas_planilha({'Data Fatura': origem.get('data_fatura'),
+                            'Data Lanc': origem.get('data')}) if origem is not None else {}
     return {
+        **datas,
         'versao': 1, 'uf': 'RJ', 'tipo_guia': 'DARJ', 'numero_guia': guia['numero'],
         'nota_fiscal': alvo.nota_raw, 'centro': alvo.centro, 'competencia': f'{ano}-{mes}',
         'data_emissao': retorno.data_emissao.isoformat(),
